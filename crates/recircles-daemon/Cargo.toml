@@ -1,0 +1,16 @@
+[package]
+name = "recircles-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "recircles-daemon"
+path = "src/main.rs"
+
+[dependencies]
+recircles-core = { path = "../recircles-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

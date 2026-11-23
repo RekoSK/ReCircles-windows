@@ -1,0 +1,14 @@
+[package]
+name = "recircles-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+recircles-submenu-abi = { path = "../recircles-submenu-abi" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
