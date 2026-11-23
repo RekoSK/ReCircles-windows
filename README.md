@@ -1,6 +1,6 @@
 # ReCircles for Windows
 
-[ReCircles Website](recircles.rekosk.dev)
+[ReCircles Website](https://recircles.rekosk.dev)
 
 Native Windows recreation of **ReCircles (Linux)**. It isn't a 1:1 port because it has features which Linux port doesn't have and doesn't have some which Linux port has. That's why this port **is still in beta**, and there is a big possibility **it won't get updates from me as often as the Linux port**, because... I don't like windows lol...
 
