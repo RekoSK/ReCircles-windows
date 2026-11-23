@@ -110,6 +110,73 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Update { check_only } => {
+            attach_console_if_needed();
+            let cfg = store.load_or_create(&installed).unwrap_or_default();
+            match recircles_core::updater::check_for_update(
+                store.dir(),
+                cfg.updates.include_prereleases,
+            ) {
+                Ok(recircles_core::updater::CheckOutcome::UpToDate { current, .. }) => {
+                    println!("ReCircles is up to date (v{current}).");
+                    ExitCode::SUCCESS
+                }
+                Ok(recircles_core::updater::CheckOutcome::UpdateAvailable(rel)) => {
+                    println!(
+                        "Update available: v{} (current: v{})",
+                        rel.version,
+                        recircles_core::updater::CURRENT_VERSION
+                    );
+                    if check_only {
+                        return ExitCode::SUCCESS;
+                    }
+                    println!("Downloading {}…", rel.asset_name);
+                    match recircles_core::updater::download_update(store.dir(), &rel) {
+                        Ok(path) => {
+                            #[cfg(windows)]
+                            {
+                                let install_dir =
+                                    recircles_core::updater::installed_dir_from_manifest(
+                                        store.dir(),
+                                    )
+                                    .unwrap_or_else(recircles_core::paths::exe_dir);
+                                match recircles_core::updater::launch_installer_upgrade(
+                                    &path,
+                                    &install_dir,
+                                    store.dir(),
+                                    Some(std::process::id()),
+                                    recircles_core::updater::CURRENT_VERSION,
+                                    &rel.version,
+                                    false,
+                                ) {
+                                    Ok(()) => {
+                                        println!("Launched updater for v{}.", rel.version);
+                                        ExitCode::SUCCESS
+                                    }
+                                    Err(e) => {
+                                        eprintln!("error: {e}");
+                                        ExitCode::FAILURE
+                                    }
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                let _ = path;
+                                ExitCode::SUCCESS
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::ShowMain => run_gui(store, installed, None),
         Command::RunMenu(target) => run_gui(store, installed, Some(target)),
     }

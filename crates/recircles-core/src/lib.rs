@@ -9,6 +9,7 @@ pub mod motion;
 pub mod paths;
 pub mod settings;
 pub mod themes;
+pub mod updater;
 pub mod win_hook;
 pub mod win_keys;
 

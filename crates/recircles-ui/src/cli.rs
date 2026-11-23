@@ -6,6 +6,7 @@ pub enum Command {
     Remove(String),
     Config { force: bool },
     ResetHistory,
+    Update { check_only: bool },
     Help,
     Version,
 }
@@ -47,6 +48,17 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             Ok(Command::Config { force })
         }
         "reset" => Ok(Command::ResetHistory),
+        "update" => {
+            let mut check_only = false;
+            for rest in &args[1..] {
+                if rest == "--check" || rest == "-c" {
+                    check_only = true;
+                } else {
+                    return Err(format!("Unknown flag for update: '{rest}'"));
+                }
+            }
+            Ok(Command::Update { check_only })
+        }
         other => Err(format!("Unknown argument '{other}'. Try 'recircles --help'.")),
     }
 }
@@ -63,6 +75,7 @@ pub fn help_text() -> &'static str {
         "  recircles.exe remove <menu>       Remove a menu from config\n",
         "  recircles.exe config [--force]    Generate default config file\n",
         "  recircles.exe reset               Reset saved most-used apps & folders memory\n",
+        "  recircles.exe update [--check]    Check for or install updates from GitHub\n",
         "  recircles.exe -h, --help          Print this help message\n",
         "  recircles.exe -V, --version       Print version\n"
     )
@@ -82,6 +95,8 @@ mod tests {
         assert_eq!(parse_args(&s(&["config", "-f"])).unwrap(), Command::Config { force: true });
         assert_eq!(parse_args(&s(&["config"])).unwrap(), Command::Config { force: false });
         assert_eq!(parse_args(&s(&["reset"])).unwrap(), Command::ResetHistory);
+        assert_eq!(parse_args(&s(&["update"])).unwrap(), Command::Update { check_only: false });
+        assert_eq!(parse_args(&s(&["update", "--check"])).unwrap(), Command::Update { check_only: true });
         assert_eq!(parse_args(&s(&["--help"])).unwrap(), Command::Help);
         assert!(parse_args(&s(&["--run"])).is_err());
         assert!(parse_args(&s(&["--bogus"])).is_err());

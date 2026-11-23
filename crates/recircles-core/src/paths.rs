@@ -127,3 +127,11 @@ pub fn usage_file_in(dir: &std::path::Path) -> PathBuf {
 pub fn install_manifest_in(dir: &std::path::Path) -> PathBuf {
     dir.join("installed.json")
 }
+
+pub fn updates_dir_in(dir: &std::path::Path) -> PathBuf {
+    dir.join("updates")
+}
+
+pub fn update_state_in(dir: &std::path::Path) -> PathBuf {
+    dir.join("update_state.json")
+}

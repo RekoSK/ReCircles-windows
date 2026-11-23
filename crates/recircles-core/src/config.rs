@@ -779,12 +779,90 @@ pub struct MenuConfig {
     pub items: Vec<MenuItemConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    #[default]
+    #[serde(alias = "auto")]
+    AutoInstall,
+    Notify,
+    Manual,
+}
+
+impl UpdateMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoInstall => "Auto-install",
+            Self::Notify => "Notify Only",
+            Self::Manual => "Manual Only",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::AutoInstall => "Auto-install",
+            Self::Notify => "Notify",
+            Self::Manual => "Manual",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::AutoInstall => "Check on startup & install automatically when idle",
+            Self::Notify => "Check on startup & notify in tray before installing",
+            Self::Manual => "Only check when you click Check for Updates",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AutoInstall => Self::Notify,
+            Self::Notify => Self::Manual,
+            Self::Manual => Self::AutoInstall,
+        }
+    }
+
+    pub fn from_cli(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" | "auto_install" | "auto-install" | "automatic" => Some(Self::AutoInstall),
+            "notify" | "notify_only" | "notify-only" => Some(Self::Notify),
+            "manual" | "manual_only" | "manual-only" | "off" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub mode: UpdateMode,
+    pub include_prereleases: bool,
+    pub check_interval_hours: u32,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            mode: UpdateMode::AutoInstall,
+            include_prereleases: env!("CARGO_PKG_VERSION").contains('-'),
+            check_interval_hours: 12,
+        }
+    }
+}
+
+impl UpdatesConfig {
+    pub fn validate(&mut self) {
+        self.check_interval_hours = self.check_interval_hours.clamp(1, 168);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub appearance: AppearanceConfig,
     pub colors: ColorsConfig,
     pub keybinds: KeybindsConfig,
+    pub updates: UpdatesConfig,
     #[serde(deserialize_with = "deserialize_main_menu")]
     pub main_menu: Vec<MainMenuEntry>,
     pub menus: BTreeMap<String, MenuConfig>,
@@ -809,6 +887,7 @@ impl AppConfig {
             appearance: AppearanceConfig::default(),
             colors: ColorsConfig::default(),
             keybinds: KeybindsConfig::default(),
+            updates: UpdatesConfig::default(),
             main_menu,
             menus: BTreeMap::new(),
         }
@@ -914,6 +993,7 @@ impl AppConfig {
 
     pub fn validate(&mut self) -> Result<(), String> {
         self.appearance.validate();
+        self.updates.validate();
         self.colors.validate()?;
         self.keybinds.validate()?;
         self.keybinds.canonicalize();

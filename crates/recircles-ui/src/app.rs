@@ -66,13 +66,24 @@ pub enum AsyncJobResult {
         id: String,
         result: Result<Vec<MenuItemConfig>, String>,
     },
+    UpdateChecked {
+        job_gen: u64,
+        result: Result<recircles_core::updater::CheckOutcome, String>,
+    },
+    UpdateDownloaded {
+        job_gen: u64,
+        version: String,
+        result: Result<std::path::PathBuf, String>,
+    },
 }
 
 impl AsyncJobResult {
     fn job_gen(&self) -> u64 {
         match self {
             Self::AppsLoaded { job_gen, .. }
-            | Self::CustomMenuLoaded { job_gen, .. } => *job_gen,
+            | Self::CustomMenuLoaded { job_gen, .. }
+            | Self::UpdateChecked { job_gen, .. }
+            | Self::UpdateDownloaded { job_gen, .. } => *job_gen,
         }
     }
 }
@@ -498,7 +509,9 @@ impl App {
     pub fn tick(&mut self, dt: f64) -> Vec<UiEffect> {
         let mut effects = Vec::new();
         while let Ok(msg) = self.async_rx.try_recv() {
-            self.handle_async_result(msg);
+            if let Some(eff) = self.handle_async_result(msg) {
+                effects.push(eff);
+            }
         }
         self.ring_motion.advance(dt);
         if let Some(s) = &mut self.slider {
@@ -582,7 +595,7 @@ impl App {
         self.ring_motion.set_loading(false, animate);
     }
 
-    fn handle_async_result(&mut self, res: AsyncJobResult) {
+    fn handle_async_result(&mut self, res: AsyncJobResult) -> Option<UiEffect> {
         let is_current = res.job_gen() == self.async_gen;
         if is_current {
             self.stop_loading();
@@ -625,7 +638,67 @@ impl App {
                     }
                 }
             }
+            AsyncJobResult::UpdateChecked { result, .. } => {
+                if is_current {
+                    match result {
+                        Ok(recircles_core::updater::CheckOutcome::UpdateAvailable(rel)) => {
+                            self.notice = Some(format!("Update v{} available", rel.version));
+                        }
+                        Ok(recircles_core::updater::CheckOutcome::UpToDate { current, .. }) => {
+                            self.notice = Some(format!("Up to date (v{current})"));
+                        }
+                        Err(e) => {
+                            self.notice = Some(format!("Update check failed: {e}"));
+                        }
+                    }
+                    if self.mode == Mode::Settings {
+                        self.rebuild_settings_entries();
+                    }
+                }
+            }
+            AsyncJobResult::UpdateDownloaded {
+                version, result, ..
+            } => {
+                if is_current {
+                    match result {
+                        Ok(_installer_path) => {
+                            #[cfg(windows)]
+                            {
+                                let install_dir = recircles_core::updater::installed_dir_from_manifest(
+                                    self.store.dir(),
+                                )
+                                .unwrap_or_else(recircles_core::paths::exe_dir);
+                                match recircles_core::updater::launch_installer_upgrade(
+                                    &_installer_path,
+                                    &install_dir,
+                                    self.store.dir(),
+                                    Some(std::process::id()),
+                                    recircles_core::updater::CURRENT_VERSION,
+                                    &version,
+                                    false,
+                                ) {
+                                    Ok(()) => return Some(UiEffect::CloseApp),
+                                    Err(e) => {
+                                        self.notice = Some(format!("Failed launching updater: {e}"));
+                                    }
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                let _ = version;
+                            }
+                        }
+                        Err(e) => {
+                            self.notice = Some(format!("Download failed: {e}"));
+                        }
+                    }
+                    if self.mode == Mode::Settings {
+                        self.rebuild_settings_entries();
+                    }
+                }
+            }
         }
+        None
     }
 
     pub fn open_menu_target(&mut self, raw_id: &str, check_installed: bool) -> Result<(), String> {
@@ -3129,6 +3202,64 @@ impl App {
                 self.rebuild_settings_entries();
                 self.notice = Some("Main menu reset to defaults".into());
                 UiEffect::None
+            }
+            SettingsAction::CheckForUpdates => {
+                let job_gen = self.bump_async_gen();
+                let use_3d = self.cfg.appearance.loading_animation == LoadingStyle::ThreeD;
+                self.start_loading(use_3d);
+                self.notice = Some("Checking GitHub Releases…".into());
+                let cfg_dir = self.store.dir().to_path_buf();
+                let include_pre = self.cfg.updates.include_prereleases;
+                let tx = self.async_tx.clone();
+                std::thread::spawn(move || {
+                    let result = recircles_core::updater::check_for_update(&cfg_dir, include_pre);
+                    let _ = tx.send(AsyncJobResult::UpdateChecked { job_gen, result });
+                });
+                UiEffect::None
+            }
+            SettingsAction::InstallUpdate => {
+                let state = recircles_core::updater::UpdateState::load(self.store.dir());
+                let Some(rel) = state
+                    .available_update_for(recircles_core::updater::CURRENT_VERSION)
+                    .cloned()
+                else {
+                    self.notice = Some("No pending update found".into());
+                    return UiEffect::None;
+                };
+                let job_gen = self.bump_async_gen();
+                let use_3d = self.cfg.appearance.loading_animation == LoadingStyle::ThreeD;
+                self.start_loading(use_3d);
+                self.notice = Some(format!("Downloading v{}…", rel.version));
+                let cfg_dir = self.store.dir().to_path_buf();
+                let version = rel.version.clone();
+                let tx = self.async_tx.clone();
+                std::thread::spawn(move || {
+                    let result = recircles_core::updater::download_update(&cfg_dir, &rel);
+                    let _ = tx.send(AsyncJobResult::UpdateDownloaded {
+                        job_gen,
+                        version,
+                        result,
+                    });
+                });
+                UiEffect::None
+            }
+            SettingsAction::CycleUpdateMode => {
+                self.cfg.updates.mode = self.cfg.updates.mode.next();
+                let _ = self.store.save(&self.cfg);
+                self.rebuild_settings_entries();
+                self.notice = Some(format!("Updates: {}", self.cfg.updates.mode.label()));
+                UiEffect::NotifyDaemonReload
+            }
+            SettingsAction::TogglePrereleases => {
+                self.cfg.updates.include_prereleases = !self.cfg.updates.include_prereleases;
+                let _ = self.store.save(&self.cfg);
+                self.rebuild_settings_entries();
+                self.notice = Some(if self.cfg.updates.include_prereleases {
+                    "Beta / Pre-releases enabled".into()
+                } else {
+                    "Stable releases only".into()
+                });
+                UiEffect::NotifyDaemonReload
             }
             SettingsAction::ResetMemory => {
                 match self.history.reset_in_place() {

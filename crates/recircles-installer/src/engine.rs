@@ -1,5 +1,5 @@
 use recircles_core::config::{
-    AppConfig, AppearanceConfig, ConfigStore, KeyList, KeybindsConfig, MainMenuEntry,
+    AppConfig, AppearanceConfig, ConfigStore, KeyList, KeybindsConfig, MainMenuEntry, UpdateMode,
 };
 use recircles_core::modules::{BuiltinSubmenu, InstalledModules};
 use recircles_core::paths;
@@ -61,6 +61,7 @@ pub struct InstallOptions {
     pub submenu_hotkeys: BTreeMap<String, String>,
     pub nav_preset: NavPreset,
     pub selected_submenus: BTreeSet<BuiltinSubmenu>,
+    pub update_mode: UpdateMode,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub start_with_windows: bool,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -86,12 +87,50 @@ impl Default for InstallOptions {
             submenu_hotkeys: BTreeMap::new(),
             nav_preset: NavPreset::Standard,
             selected_submenus: selected,
+            update_mode: UpdateMode::AutoInstall,
             start_with_windows: true,
             create_shortcuts: true,
             launch_daemon: true,
             register_windows_integration: true,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeOptions {
+    pub install_dir: Option<PathBuf>,
+    pub config_dir: PathBuf,
+    pub wait_pid: Option<u32>,
+    pub launch_daemon: bool,
+    pub register_windows_integration: bool,
+}
+
+impl Default for UpgradeOptions {
+    fn default() -> Self {
+        Self {
+            install_dir: None,
+            config_dir: paths::config_dir(),
+            wait_pid: None,
+            launch_daemon: true,
+            register_windows_integration: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeProgress {
+    pub fraction: f32,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeSummary {
+    pub install_dir: PathBuf,
+    #[allow(dead_code)]
+    pub previous_version: Option<String>,
+    pub new_version: String,
+    pub updated_dlls: Vec<String>,
+    pub skipped_dlls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +350,9 @@ pub fn execute_install(
         return Err(format!("Unknown theme '{}'", opts.theme));
     }
 
+    // Apply update mode chosen in the installer
+    cfg.updates.mode = opts.update_mode;
+
     // Keybinds (already validated into preview_kb; prune any custom menu refs that don't exist)
     preview_kb.menu_keybinds.retain(|id, _| match BuiltinSubmenu::from_id(id) {
         Some(sub) => selected.contains(&sub),
@@ -362,6 +404,193 @@ pub fn execute_install(
     })
 }
 
+pub fn execute_upgrade<F>(
+    opts: &UpgradeOptions,
+    override_payload: Option<PayloadOverride<'_>>,
+    mut on_progress: F,
+) -> Result<UpgradeSummary, String>
+where
+    F: FnMut(UpgradeProgress),
+{
+    on_progress(UpgradeProgress {
+        fraction: 0.08,
+        status: "Preparing update…",
+    });
+
+    let existing_manifest = load_existing_manifest(&opts.config_dir);
+    let install_dir = opts
+        .install_dir
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            existing_manifest
+                .as_ref()
+                .map(|m| PathBuf::from(m.install_dir.trim()))
+                .filter(|p| !p.as_os_str().is_empty())
+        })
+        .unwrap_or_else(default_install_dir);
+
+    let submenus_dir = install_dir.join("submenus");
+
+    // Preserve exact set of installed optional submenus (never re-install skipped DLLs!)
+    let mut selected = BTreeSet::new();
+    if let Some(ref m) = existing_manifest
+        && !m.submenus.is_empty()
+    {
+        for id in &m.submenus {
+            if let Some(sub) = BuiltinSubmenu::from_id(id) {
+                selected.insert(sub);
+            }
+        }
+    } else {
+        let detected = InstalledModules::detect_in(submenus_dir.clone());
+        let any_optional = BuiltinSubmenu::OPTIONAL
+            .iter()
+            .any(|&sub| detected.is_installed(sub));
+        if any_optional || install_dir.join("recircles.exe").is_file() {
+            for &sub in BuiltinSubmenu::OPTIONAL.iter() {
+                if detected.is_installed(sub) {
+                    selected.insert(sub);
+                }
+            }
+        } else {
+            for sub in BuiltinSubmenu::ALL {
+                selected.insert(sub);
+            }
+        }
+    }
+    enforce_mandatory_submenus(&mut selected);
+
+    on_progress(UpgradeProgress {
+        fraction: 0.22,
+        status: "Stopping ReCircles…",
+    });
+
+    #[cfg(windows)]
+    if opts.register_windows_integration {
+        let _ = recircles_core::ipc::win::close_existing_ui_instances();
+        let _ = recircles_core::ipc::win::stop_daemon_gracefully();
+        wait_for_processes_to_exit(opts.wait_pid);
+    }
+
+    fs::create_dir_all(&install_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", install_dir.display()))?;
+    fs::create_dir_all(&submenus_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", submenus_dir.display()))?;
+
+    let read_artifact = |name: &str, embedded: &'static [u8]| -> std::borrow::Cow<'static, [u8]> {
+        if let Some(cb) = override_payload
+            && let Some(bytes) = cb(name)
+        {
+            return std::borrow::Cow::Owned(bytes);
+        }
+        std::borrow::Cow::Borrowed(embedded)
+    };
+
+    on_progress(UpgradeProgress {
+        fraction: 0.44,
+        status: "Updating core binaries…",
+    });
+
+    let ui_bytes = read_artifact("recircles.exe", payload::BIN_UI);
+    if !ui_bytes.is_empty() {
+        atomic_write_with_retry(&install_dir.join("recircles.exe"), &ui_bytes)?;
+    }
+    let daemon_bytes = read_artifact("recircles-daemon.exe", payload::BIN_DAEMON);
+    if !daemon_bytes.is_empty() {
+        atomic_write_with_retry(&install_dir.join("recircles-daemon.exe"), &daemon_bytes)?;
+    }
+
+    if opts.register_windows_integration
+        && let Ok(cur_exe) = std::env::current_exe()
+    {
+        let target_setup = install_dir.join("recircles-setup.exe");
+        if cur_exe != target_setup && cur_exe.is_file() {
+            let _ = copy_file_with_retry(&cur_exe, &target_setup);
+        }
+    }
+
+    on_progress(UpgradeProgress {
+        fraction: 0.68,
+        status: "Updating submenus…",
+    });
+
+    let mut updated_dlls = Vec::new();
+    let mut skipped_dlls = Vec::new();
+    for sub in BuiltinSubmenu::OPTIONAL {
+        let dll_name = sub.dll_filename().expect("optional sub has dll");
+        let dst = submenus_dir.join(dll_name);
+        if selected.contains(&sub) {
+            let bytes = read_artifact(dll_name, payload::dll_bytes(sub).unwrap_or(b""));
+            if !bytes.is_empty() {
+                atomic_write_with_retry(&dst, &bytes)?;
+            } else if override_payload.is_some() {
+                atomic_write_with_retry(&dst, b"")?;
+            }
+            updated_dlls.push(dll_name.to_string());
+        } else {
+            skipped_dlls.push(dll_name.to_string());
+        }
+    }
+
+    on_progress(UpgradeProgress {
+        fraction: 0.84,
+        status: "Finalizing update…",
+    });
+
+    // Preserve user config completely — only refresh installed.json version metadata
+    fs::create_dir_all(&opts.config_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", opts.config_dir.display()))?;
+    let mut sub_ids: Vec<String> = selected.iter().map(|s| s.id().to_string()).collect();
+    sub_ids.sort();
+    let previous_version = existing_manifest.as_ref().map(|m| m.version.clone());
+    let preserved_theme = existing_manifest
+        .as_ref()
+        .map(|m| m.theme.clone())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "default".into());
+    let new_version = env!("CARGO_PKG_VERSION").to_string();
+    let manifest = InstallManifest {
+        version: new_version.clone(),
+        install_dir: install_dir.to_string_lossy().into_owned(),
+        submenus: sub_ids,
+        theme: preserved_theme,
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+    atomic_write_with_retry(
+        &paths::install_manifest_in(&opts.config_dir),
+        manifest_json.as_bytes(),
+    )?;
+
+    #[cfg(windows)]
+    if opts.register_windows_integration {
+        let _ = win_sys::update_uninstall_metadata(&install_dir);
+    }
+
+    on_progress(UpgradeProgress {
+        fraction: 0.94,
+        status: "Launching ReCircles…",
+    });
+
+    #[cfg(windows)]
+    if opts.register_windows_integration && opts.launch_daemon {
+        let _ = recircles_core::ipc::win::launch_daemon_detached(&install_dir);
+    }
+
+    on_progress(UpgradeProgress {
+        fraction: 1.0,
+        status: "Updated!",
+    });
+
+    Ok(UpgradeSummary {
+        install_dir,
+        previous_version,
+        new_version,
+        updated_dlls,
+        skipped_dlls,
+    })
+}
+
 pub fn execute_uninstall(install_dir: &Path, config_dir: &Path, purge_config: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -396,6 +625,73 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(&tmp, bytes).map_err(|e| format!("Failed writing {}: {e}", tmp.display()))?;
     let _ = fs::remove_file(path);
     fs::rename(&tmp, path).map_err(|e| format!("Failed replacing {}: {e}", path.display()))
+}
+
+fn atomic_write_with_retry(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..15 {
+        match atomic_write(path, bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt < 14 {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(windows)]
+fn copy_file_with_retry(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..10 {
+        match fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 9 {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(windows)]
+fn wait_for_processes_to_exit(wait_pid: Option<u32>) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    if let Some(pid) = wait_pid
+        && pid != 0
+        && pid != std::process::id()
+    {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if !h.is_null() {
+            unsafe {
+                WaitForSingleObject(h, 4000);
+                CloseHandle(h);
+            }
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let ui_gone = recircles_core::ipc::win::find_ui_hwnd().is_null();
+        let daemon_gone = recircles_core::ipc::win::find_daemon_hwnd().is_null();
+        if ui_gone && daemon_gone {
+            if let Some(guard) = recircles_core::ipc::win::acquire_daemon_mutex() {
+                drop(guard);
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(80));
 }
 
 #[cfg(windows)]
@@ -472,6 +768,44 @@ mod win_sys {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(|a| PathBuf::from(a).join("Microsoft\\Windows\\Start Menu\\Programs\\ReCircles"))
+    }
+
+    pub fn update_uninstall_metadata(install_dir: &std::path::Path) -> Result<(), String> {
+        let ui_exe = install_dir.join("recircles.exe");
+        let setup_exe = install_dir.join("recircles-setup.exe");
+        write_reg_sz(HKEY_CURRENT_USER, UNINSTALL_KEY, "DisplayName", "ReCircles")?;
+        write_reg_sz(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            "DisplayVersion",
+            env!("CARGO_PKG_VERSION"),
+        )?;
+        write_reg_sz(HKEY_CURRENT_USER, UNINSTALL_KEY, "Publisher", "ReCircles")?;
+        write_reg_sz(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            "InstallLocation",
+            &install_dir.to_string_lossy(),
+        )?;
+        write_reg_sz(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            "UninstallString",
+            &format!("\"{}\" --uninstall", setup_exe.display()),
+        )?;
+        write_reg_sz(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            "ModifyPath",
+            &format!("\"{}\"", setup_exe.display()),
+        )?;
+        write_reg_sz(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            "DisplayIcon",
+            &format!("{},0", ui_exe.display()),
+        )?;
+        Ok(())
     }
 
     pub fn apply_windows_integration(opts: &InstallOptions) -> Result<(), String> {
@@ -697,6 +1031,7 @@ mod tests {
             submenu_hotkeys: hotkeys,
             nav_preset: NavPreset::Vim,
             selected_submenus: selected,
+            update_mode: UpdateMode::AutoInstall,
             start_with_windows: false,
             create_shortcuts: false,
             launch_daemon: false,
@@ -797,6 +1132,7 @@ mod tests {
             submenu_hotkeys: BTreeMap::new(),
             nav_preset: NavPreset::Standard,
             selected_submenus: selected.clone(),
+            update_mode: UpdateMode::AutoInstall,
             start_with_windows: false,
             create_shortcuts: false,
             launch_daemon: false,
@@ -889,6 +1225,7 @@ mod tests {
             submenu_hotkeys: BTreeMap::new(),
             nav_preset: NavPreset::Standard,
             selected_submenus: BuiltinSubmenu::ALL.into_iter().collect(),
+            update_mode: UpdateMode::Notify,
             start_with_windows: false,
             create_shortcuts: false,
             launch_daemon: false,
@@ -917,6 +1254,87 @@ mod tests {
         assert_eq!(cfg.keybinds.main_menu.primary(), Some("Alt+Space"));
         assert_eq!(cfg.keybinds.back.primary(), Some("Backspace"));
         assert_eq!(cfg.keybinds.help.primary(), Some("F2"));
+        assert_eq!(cfg.updates.mode, UpdateMode::Notify);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_replaces_installed_binaries_and_preserves_config_and_exclusions() {
+        let root = temp_root("upgrade_preserve");
+        let install_dir = root.join("app");
+        let config_dir = root.join("cfg");
+
+        let mut selected = BTreeSet::new();
+        selected.insert(BuiltinSubmenu::Files);
+        selected.insert(BuiltinSubmenu::Clipboard);
+
+        let opts = InstallOptions {
+            install_dir: install_dir.clone(),
+            config_dir: config_dir.clone(),
+            theme: "midnight".into(),
+            appearance: AppearanceConfig::default(),
+            keybinds: KeybindsConfig::default(),
+            custom_keybinds: true,
+            main_hotkey: "Ctrl+Shift+Space".into(),
+            submenu_hotkeys: BTreeMap::new(),
+            nav_preset: NavPreset::Vim,
+            selected_submenus: selected,
+            update_mode: UpdateMode::Notify,
+            start_with_windows: false,
+            create_shortcuts: false,
+            launch_daemon: false,
+            register_windows_integration: false,
+        };
+
+        let v1 = |name: &str| Some(format!("v1:{name}").into_bytes());
+        execute_install(&opts, Some(&v1)).expect("v1 install succeeds");
+
+        let cfg_before = fs::read_to_string(paths::config_file_in(&config_dir)).unwrap();
+        assert!(install_dir.join("submenus/recircles_files.dll").is_file());
+        assert!(install_dir.join("submenus/recircles_clipboard.dll").is_file());
+        assert!(!install_dir.join("submenus/recircles_apps.dll").exists());
+        assert!(!install_dir.join("submenus/recircles_windows.dll").exists());
+
+        let up_opts = UpgradeOptions {
+            install_dir: Some(install_dir.clone()),
+            config_dir: config_dir.clone(),
+            wait_pid: None,
+            launch_daemon: false,
+            register_windows_integration: false,
+        };
+        let v2 = |name: &str| Some(format!("v2:{name}").into_bytes());
+        let mut stages = Vec::new();
+        let sum = execute_upgrade(&up_opts, Some(&v2), |p| stages.push(p.fraction))
+            .expect("upgrade succeeds");
+
+        assert!(stages.last().copied().unwrap_or(0.0) >= 0.99);
+        assert_eq!(fs::read(install_dir.join("recircles.exe")).unwrap(), b"v2:recircles.exe");
+        assert_eq!(
+            fs::read(install_dir.join("recircles-daemon.exe")).unwrap(),
+            b"v2:recircles-daemon.exe"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("submenus/recircles_files.dll")).unwrap(),
+            b"v2:recircles_files.dll"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("submenus/recircles_clipboard.dll")).unwrap(),
+            b"v2:recircles_clipboard.dll"
+        );
+        assert!(
+            !install_dir.join("submenus/recircles_apps.dll").exists(),
+            "upgrade must never install previously excluded submenus"
+        );
+        assert!(
+            !install_dir.join("submenus/recircles_windows.dll").exists(),
+            "upgrade must never install previously excluded submenus"
+        );
+        assert_eq!(sum.updated_dlls.len(), 2);
+        assert_eq!(sum.skipped_dlls.len(), 2);
+
+        let cfg_after = fs::read_to_string(paths::config_file_in(&config_dir)).unwrap();
+        assert_eq!(cfg_before, cfg_after, "recircles.json must remain untouched on upgrade");
 
         let _ = fs::remove_dir_all(root);
     }

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta"
+version = "0.2.0-beta"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
@@ -26,6 +26,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_GdiPlus",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",

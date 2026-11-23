@@ -10,7 +10,10 @@ mod spring;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod vsync;
 
-use engine::{InstallOptions, NavPreset, execute_install, execute_uninstall};
+use engine::{
+    InstallOptions, NavPreset, UpgradeOptions, execute_install, execute_uninstall, execute_upgrade,
+};
+use recircles_core::config::UpdateMode;
 use recircles_core::modules::BuiltinSubmenu;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,6 +24,13 @@ enum Mode {
     Gui,
     Help,
     SilentInstall(Box<SilentArgs>),
+    Upgrade(Box<UpgradeCliArgs>),
+    PreviewUpdating {
+        progress_pct: u8,
+        config_dir: PathBuf,
+        from_version: Option<String>,
+        to_version: Option<String>,
+    },
     Uninstall {
         install_dir: PathBuf,
         config_dir: PathBuf,
@@ -37,8 +47,21 @@ struct SilentArgs {
     main_hotkey: Option<String>,
     submenu_hotkeys: Vec<(String, String)>,
     nav_preset: NavPreset,
+    update_mode: Option<UpdateMode>,
     no_launch: bool,
     no_integration: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpgradeCliArgs {
+    install_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+    wait_pid: Option<u32>,
+    from_version: Option<String>,
+    to_version: Option<String>,
+    no_launch: bool,
+    no_integration: bool,
+    headless: bool,
 }
 
 fn parse_cli(args: &[String]) -> Result<Mode, String> {
@@ -46,8 +69,15 @@ fn parse_cli(args: &[String]) -> Result<Mode, String> {
         return Ok(Mode::Gui);
     }
     let mut silent = false;
+    let mut upgrade = false;
+    let mut preview_updating = false;
+    let mut preview_pct: u8 = 62;
     let mut uninstall = false;
     let mut purge = false;
+    let mut headless = false;
+    let mut wait_pid: Option<u32> = None;
+    let mut from_version: Option<String> = None;
+    let mut to_version: Option<String> = None;
     let mut s = SilentArgs {
         install_dir: None,
         config_dir: None,
@@ -56,6 +86,7 @@ fn parse_cli(args: &[String]) -> Result<Mode, String> {
         main_hotkey: None,
         submenu_hotkeys: Vec::new(),
         nav_preset: NavPreset::Standard,
+        update_mode: None,
         no_launch: false,
         no_integration: false,
     };
@@ -65,10 +96,45 @@ fn parse_cli(args: &[String]) -> Result<Mode, String> {
         match args[i].as_str() {
             "-h" | "--help" => return Ok(Mode::Help),
             "--silent" => silent = true,
+            "--upgrade" => upgrade = true,
+            "--headless" => headless = true,
+            "--preview-updating" => {
+                preview_updating = true;
+                if let Some(next) = args.get(i + 1)
+                    && let Ok(pct) = next.parse::<u8>()
+                {
+                    preview_pct = pct.min(100);
+                    i += 1;
+                }
+            }
             "--uninstall" => uninstall = true,
             "--purge-config" => purge = true,
             "--no-start-launch" => s.no_launch = true,
             "--no-integration" => s.no_integration = true,
+            "--wait-pid" => {
+                i += 1;
+                let raw = args.get(i).ok_or("Missing --wait-pid value")?;
+                wait_pid = Some(
+                    raw.parse::<u32>()
+                        .map_err(|_| format!("Invalid --wait-pid '{raw}'"))?,
+                );
+            }
+            "--from-version" => {
+                i += 1;
+                from_version = Some(args.get(i).ok_or("Missing --from-version value")?.clone());
+            }
+            "--to-version" => {
+                i += 1;
+                to_version = Some(args.get(i).ok_or("Missing --to-version value")?.clone());
+            }
+            "--update-mode" => {
+                i += 1;
+                let raw = args.get(i).ok_or("Missing --update-mode value")?;
+                s.update_mode = Some(
+                    UpdateMode::from_cli(raw)
+                        .ok_or_else(|| format!("Unknown --update-mode '{raw}' (use auto, notify, or manual)"))?,
+                );
+            }
             "--install-dir" => {
                 i += 1;
                 s.install_dir = Some(PathBuf::from(args.get(i).ok_or("Missing --install-dir path")?));
@@ -118,6 +184,26 @@ fn parse_cli(args: &[String]) -> Result<Mode, String> {
         i += 1;
     }
 
+    if preview_updating {
+        return Ok(Mode::PreviewUpdating {
+            progress_pct: preview_pct,
+            config_dir: s.config_dir.unwrap_or_else(recircles_core::paths::config_dir),
+            from_version,
+            to_version,
+        });
+    }
+    if upgrade {
+        return Ok(Mode::Upgrade(Box::new(UpgradeCliArgs {
+            install_dir: s.install_dir,
+            config_dir: s.config_dir,
+            wait_pid,
+            from_version,
+            to_version,
+            no_launch: s.no_launch,
+            no_integration: s.no_integration,
+            headless: headless || silent,
+        })));
+    }
     if uninstall {
         return Ok(Mode::Uninstall {
             install_dir: s.install_dir.unwrap_or_else(engine::default_install_dir),
@@ -166,9 +252,10 @@ fn main() -> ExitCode {
                 "ReCircles Windows Installer v{}\n\n\
                  USAGE:\n\
                    recircles-setup.exe                  Launch interactive setup wizard\n\
+                   recircles-setup.exe --upgrade        Upgrade existing installation in place\n\
                    recircles-setup.exe --silent [opts]  Scripted installation/modification\n\
                    recircles-setup.exe --uninstall      Uninstall binaries & DLLs\n\n\
-                 SILENT OPTIONS:\n\
+                 SILENT / UPGRADE OPTIONS:\n\
                    --install-dir <path>\n\
                    --config-dir <path>\n\
                    --theme <id>\n\
@@ -176,11 +263,76 @@ fn main() -> ExitCode {
                    --main-hotkey <spec>      e.g. Ctrl+Alt+Space\n\
                    --hotkey <id>=<spec>      e.g. clipboard=Ctrl+Alt+v (repeatable)\n\
                    --nav-preset standard|vim\n\
+                   --update-mode auto|notify|manual\n\
+                   --wait-pid <pid>          Wait for PID to exit before upgrading\n\
+                   --headless                Run --upgrade without the 3D updating overlay\n\
                    --no-start-launch\n\
                    --no-integration\n",
                 env!("CARGO_PKG_VERSION")
             );
             ExitCode::SUCCESS
+        }
+        Mode::PreviewUpdating {
+            progress_pct,
+            config_dir,
+            from_version,
+            to_version,
+        } => {
+            #[cfg(windows)]
+            {
+                let rc = gui::win_gui::run_updater_preview(
+                    config_dir,
+                    progress_pct as f32 / 100.0,
+                    from_version,
+                    to_version,
+                );
+                if rc == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (progress_pct, config_dir, from_version, to_version);
+                eprintln!("Updating overlay runs only on Windows.");
+                ExitCode::FAILURE
+            }
+        }
+        Mode::Upgrade(u) => {
+            let opts = UpgradeOptions {
+                install_dir: u.install_dir,
+                config_dir: u.config_dir.unwrap_or_else(recircles_core::paths::config_dir),
+                wait_pid: u.wait_pid,
+                launch_daemon: !u.no_launch,
+                register_windows_integration: !u.no_integration,
+            };
+            #[cfg(windows)]
+            if !u.headless {
+                let rc = gui::win_gui::run_updater_overlay(opts, u.from_version, u.to_version);
+                return if rc == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            attach_console_if_needed();
+            match execute_upgrade(&opts, None, |_| {}) {
+                Ok(sum) => {
+                    println!(
+                        "Updated ReCircles in {} to v{} (updated DLLs: {:?}, skipped DLLs: {:?})",
+                        sum.install_dir.display(),
+                        sum.new_version,
+                        sum.updated_dlls,
+                        sum.skipped_dlls
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Mode::Uninstall {
             install_dir,
@@ -236,6 +388,9 @@ fn main() -> ExitCode {
                 opts.submenu_hotkeys.insert(k, v);
             }
             opts.nav_preset = s.nav_preset;
+            if let Some(um) = s.update_mode {
+                opts.update_mode = um;
+            }
             opts.launch_daemon = !s.no_launch;
             opts.register_windows_integration = !s.no_integration;
 
@@ -295,6 +450,8 @@ mod tests {
             "clipboard=Ctrl+Alt+v",
             "--nav-preset",
             "vim",
+            "--update-mode",
+            "notify",
             "--no-start-launch",
         ]))
         .unwrap();
@@ -305,6 +462,26 @@ mod tests {
         assert_eq!(args.submenus.as_ref().unwrap(), &vec!["files", "clipboard"]);
         assert_eq!(args.main_hotkey.as_deref(), Some("Ctrl+Alt+Space"));
         assert_eq!(args.nav_preset, NavPreset::Vim);
+        assert_eq!(args.update_mode, Some(UpdateMode::Notify));
         assert!(args.no_launch);
+
+        let u = parse_cli(&s(&[
+            "--upgrade",
+            "--wait-pid",
+            "4242",
+            "--from-version",
+            "0.1.0-beta",
+            "--to-version",
+            "0.1.1-beta",
+            "--headless",
+        ]))
+        .unwrap();
+        let Mode::Upgrade(uargs) = u else {
+            panic!("expected Upgrade");
+        };
+        assert_eq!(uargs.wait_pid, Some(4242));
+        assert_eq!(uargs.from_version.as_deref(), Some("0.1.0-beta"));
+        assert_eq!(uargs.to_version.as_deref(), Some("0.1.1-beta"));
+        assert!(uargs.headless);
     }
 }

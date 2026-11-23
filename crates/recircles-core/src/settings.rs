@@ -5,6 +5,7 @@ use crate::config::{
 use crate::menu::BuiltinIcon;
 use crate::modules::InstalledModules;
 use crate::themes::ColorsConfig;
+use crate::updater::{CURRENT_VERSION, UpdateState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColorGroup {
@@ -249,6 +250,7 @@ pub enum SettingsView {
     MainMenu,
     MainMenuEntry(usize),
     MainMenuAdd,
+    Updates,
     ConfirmResetMemory,
     ConfirmResetAll,
 }
@@ -281,6 +283,10 @@ pub enum SettingsAction {
         delta: isize,
     },
     ResetMainMenu,
+    CheckForUpdates,
+    InstallUpdate,
+    CycleUpdateMode,
+    TogglePrereleases,
     ResetMemory,
     ResetAllSettings,
 }
@@ -308,6 +314,7 @@ pub fn view_title(view: &SettingsView) -> &'static str {
         SettingsView::MainMenu => "Main Menu",
         SettingsView::MainMenuEntry(_) => "Main Menu Entry",
         SettingsView::MainMenuAdd => "Add Entry",
+        SettingsView::Updates => "Updates",
         SettingsView::ConfirmResetMemory => "Reset Memory",
         SettingsView::ConfirmResetAll => "Reset Settings",
     }
@@ -324,6 +331,7 @@ pub fn idle_status(view: &SettingsView) -> &'static str {
         SettingsView::MainMenu => "Select entry to move/remove",
         SettingsView::MainMenuEntry(_) => "Move earlier, move later, or remove",
         SettingsView::MainMenuAdd => "Choose installed submenu or menu to pin",
+        SettingsView::Updates => "Automatic GitHub Releases updater",
         SettingsView::ConfirmResetMemory => "Clear most-used memory?",
         SettingsView::ConfirmResetAll => "Reset all settings to defaults?",
     }
@@ -407,6 +415,22 @@ pub fn build_items(
                 accent: None,
                 action: SettingsAction::OpenView(SettingsView::MainMenu),
                 secondary_action: None,
+            },
+            {
+                let upd_state = UpdateState::load(store.dir());
+                let avail = upd_state.available_update_for(CURRENT_VERSION);
+                SettingsItem {
+                    label: "Updates".into(),
+                    detail: match avail {
+                        Some(rel) => format!("Update v{} available · {}", rel.version, cfg.updates.mode.label()),
+                        None => format!("v{CURRENT_VERSION} · {}", cfg.updates.mode.label()),
+                    },
+                    icon: BuiltinIcon::Refresh,
+                    active: avail.is_some(),
+                    accent: None,
+                    action: SettingsAction::OpenView(SettingsView::Updates),
+                    secondary_action: None,
+                }
             },
             SettingsItem {
                 label: "Reset Memory".into(),
@@ -769,6 +793,47 @@ pub fn build_items(
         }
         SettingsView::MainMenuEntry(index) => build_main_menu_entry_items(cfg, *index),
         SettingsView::MainMenuAdd => build_main_menu_add_items(cfg, installed),
+        SettingsView::Updates => {
+            let state = UpdateState::load(store.dir());
+            let mut items = Vec::new();
+            if let Some(rel) = state.available_update_for(CURRENT_VERSION) {
+                items.push(SettingsItem {
+                    label: format!("Install v{}", rel.version),
+                    detail: format!("Upgrade from v{CURRENT_VERSION} now"),
+                    icon: BuiltinIcon::Check,
+                    active: true,
+                    accent: None,
+                    action: SettingsAction::InstallUpdate,
+                    secondary_action: None,
+                });
+            }
+            items.push(SettingsItem {
+                label: "Check Now".into(),
+                detail: format!("Installed: v{CURRENT_VERSION} · GitHub Releases"),
+                icon: BuiltinIcon::Refresh,
+                active: false,
+                accent: None,
+                action: SettingsAction::CheckForUpdates,
+                secondary_action: None,
+            });
+            items.push(SettingsItem {
+                label: format!("Mode: {}", cfg.updates.mode.label()),
+                detail: format!("{} · Click to cycle", cfg.updates.mode.description()),
+                icon: BuiltinIcon::Settings,
+                active: cfg.updates.mode != crate::config::UpdateMode::Manual,
+                accent: None,
+                action: SettingsAction::CycleUpdateMode,
+                secondary_action: None,
+            });
+            items.push(toggle_item(
+                "Beta / Pre-releases",
+                cfg.updates.include_prereleases,
+                "Receiving beta & pre-release builds",
+                "Stable releases only",
+                SettingsAction::TogglePrereleases,
+            ));
+            items
+        }
         SettingsView::ConfirmResetMemory => vec![
             SettingsItem {
                 label: "Clear Memory".into(),
@@ -952,7 +1017,8 @@ mod tests {
         let mut cfg = AppConfig::default_for_installed(&installed);
 
         let root = build_items(&cfg, &store, &installed, &SettingsView::Root);
-        assert_eq!(root.len(), 6);
+        assert_eq!(root.len(), 7);
+        assert!(root.iter().any(|i| i.label == "Updates"));
         assert!(root.iter().any(|i| i.label == "Reset Memory"));
 
         let reset_mem = build_items(&cfg, &store, &installed, &SettingsView::ConfirmResetMemory);

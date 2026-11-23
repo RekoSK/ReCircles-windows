@@ -21,10 +21,10 @@ fn main() {
 
 #[cfg(windows)]
 mod win_daemon {
-    use recircles_core::config::{AppConfig, ConfigStore, HotkeyBinding};
+    use recircles_core::config::{AppConfig, ConfigStore, HotkeyBinding, UpdateMode};
     use recircles_core::ipc::{
-        DAEMON_WINDOW_CLASS, WM_APP_CLOSE_UI, WM_APP_HOOK_HOTKEY, WM_APP_QUIT_DAEMON,
-        WM_APP_RELOAD_CONFIG, WM_APP_TRAY,
+        DAEMON_WINDOW_CLASS, WM_APP_CHECK_UPDATES, WM_APP_CLOSE_UI, WM_APP_HOOK_HOTKEY,
+        WM_APP_QUIT_DAEMON, WM_APP_RELOAD_CONFIG, WM_APP_TRAY, WM_APP_UPDATE_RESULT,
         win::{
             acquire_daemon_mutex, close_existing_ui_instances, find_ui_hwnd,
             launch_ui_detached, to_wide_nul,
@@ -33,10 +33,15 @@ mod win_daemon {
     use recircles_core::modules::{BuiltinSubmenu, InstalledModules, host::SubmenuHost};
     use recircles_core::paths;
     use recircles_core::submenu_abi::SubmenuRequest;
+    use recircles_core::updater::{
+        self, CURRENT_VERSION, CheckOutcome, ReleaseInfo, UpdateState,
+    };
     use recircles_core::win_hook::{HookBindingEntry, win::GlobalHotkeyHook};
     use recircles_core::win_keys::{is_known_windows_shell_hotkey, os_locked_hotkey_reason};
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::DataExchange::{
         AddClipboardFormatListener, RemoveClipboardFormatListener,
@@ -46,23 +51,44 @@ mod win_daemon {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
     use windows_sys::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-        Shell_NotifyIconW,
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, MF_SEPARATOR,
-        MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-        TranslateMessage, WM_CLIPBOARDUPDATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP,
-        WNDCLASSEXW, WS_OVERLAPPED,
+        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, KillTimer, MF_CHECKED,
+        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+        RegisterClassExW, SetForegroundWindow, SetTimer, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLIPBOARDUPDATE,
+        WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     const TRAY_UID: u32 = 1;
+    const TIMER_UPDATE_CHECK: usize = 1;
+    const TIMER_IDLE_APPLY: usize = 2;
+
     const CMD_OPEN_MAIN: u32 = 1001;
     const CMD_RELOAD: u32 = 1002;
     const CMD_EXIT: u32 = 1003;
+    const CMD_UPDATE_CHECK: u32 = 1010;
+    const CMD_UPDATE_INSTALL: u32 = 1011;
+    const CMD_UPDATE_MODE_AUTO: u32 = 1012;
+    const CMD_UPDATE_MODE_NOTIFY: u32 = 1013;
+    const CMD_UPDATE_MODE_MANUAL: u32 = 1014;
+    const CMD_UPDATE_PRERELEASE: u32 = 1015;
     const CMD_MENU_BASE: u32 = 2000;
+
+    enum UpdateJobResult {
+        Checked {
+            manual: bool,
+            outcome: Result<CheckOutcome, String>,
+        },
+        Downloaded {
+            manual: bool,
+            release: ReleaseInfo,
+            result: Result<PathBuf, String>,
+        },
+    }
 
     struct DaemonState {
         hwnd: HWND,
@@ -75,6 +101,11 @@ mod win_daemon {
         failed_hotkeys: Vec<String>,
         clipboard_listening: bool,
         tray_icon: HICON,
+        update_busy: bool,
+        available_update: Option<ReleaseInfo>,
+        notified_version: Option<String>,
+        pending_auto_install: Option<(ReleaseInfo, PathBuf)>,
+        update_inbox: Arc<Mutex<Vec<UpdateJobResult>>>,
     }
 
     thread_local! {
@@ -131,6 +162,10 @@ mod win_daemon {
         }
 
         let store = ConfigStore::default_store();
+        updater::cleanup_old_installers(store.dir());
+        let cached_avail = UpdateState::load(store.dir())
+            .available_update_for(CURRENT_VERSION)
+            .cloned();
         let installed = InstalledModules::detect_default();
         let cfg = store
             .load_or_create(&installed)
@@ -148,9 +183,18 @@ mod win_daemon {
             failed_hotkeys: Vec::new(),
             clipboard_listening: false,
             tray_icon,
+            update_busy: false,
+            available_update: cached_avail,
+            notified_version: None,
+            pending_auto_install: None,
+            update_inbox: Arc::new(Mutex::new(Vec::new())),
         };
         add_tray_icon(&st);
         apply_runtime_config(&mut st);
+        // Check for updates immediately on tray/daemon startup when Auto-install or Notify is enabled
+        if st.cfg.updates.mode != UpdateMode::Manual {
+            start_update_check(&mut st, false);
+        }
         trim_working_set();
 
         STATE.with(|slot| *slot.borrow_mut() = Some(st));
@@ -165,6 +209,10 @@ mod win_daemon {
 
         STATE.with(|slot| {
             if let Some(mut st) = slot.borrow_mut().take() {
+                unsafe {
+                    KillTimer(st.hwnd, TIMER_UPDATE_CHECK);
+                    KillTimer(st.hwnd, TIMER_IDLE_APPLY);
+                }
                 unregister_all_hotkeys(&mut st);
                 if st.clipboard_listening {
                     unsafe {
@@ -277,6 +325,190 @@ mod win_daemon {
             }
             st.clipboard_listening = false;
         }
+        schedule_update_timer(st);
+    }
+
+    fn schedule_update_timer(st: &DaemonState) {
+        unsafe {
+            KillTimer(st.hwnd, TIMER_UPDATE_CHECK);
+        }
+        if st.cfg.updates.mode == UpdateMode::Manual {
+            return;
+        }
+        let hours = st.cfg.updates.check_interval_hours.clamp(1, 168) as u64;
+        let ms = (hours * 3_600_000).min(u32::MAX as u64) as u32;
+        unsafe {
+            SetTimer(st.hwnd, TIMER_UPDATE_CHECK, ms, None);
+        }
+    }
+
+    fn start_update_check(st: &mut DaemonState, manual: bool) {
+        if st.update_busy {
+            return;
+        }
+        st.update_busy = true;
+        update_tray_tooltip(st);
+        let config_dir = st.store.dir().to_path_buf();
+        let include_pre = st.cfg.updates.include_prereleases;
+        let inbox = st.update_inbox.clone();
+        let hwnd_raw = st.hwnd as usize;
+        std::thread::spawn(move || {
+            let outcome = updater::check_for_update(&config_dir, include_pre);
+            if let Ok(mut g) = inbox.lock() {
+                g.push(UpdateJobResult::Checked { manual, outcome });
+            }
+            unsafe {
+                PostMessageW(hwnd_raw as HWND, WM_APP_UPDATE_RESULT, 0, 0);
+            }
+        });
+    }
+
+    fn start_update_download(st: &mut DaemonState, release: ReleaseInfo, manual: bool) {
+        if st.update_busy {
+            return;
+        }
+        st.update_busy = true;
+        update_tray_tooltip(st);
+        let config_dir = st.store.dir().to_path_buf();
+        let inbox = st.update_inbox.clone();
+        let hwnd_raw = st.hwnd as usize;
+        std::thread::spawn(move || {
+            let result = updater::download_update(&config_dir, &release);
+            if let Ok(mut g) = inbox.lock() {
+                g.push(UpdateJobResult::Downloaded {
+                    manual,
+                    release,
+                    result,
+                });
+            }
+            unsafe {
+                PostMessageW(hwnd_raw as HWND, WM_APP_UPDATE_RESULT, 0, 0);
+            }
+        });
+    }
+
+    fn try_launch_upgrade(st: &mut DaemonState, release: &ReleaseInfo, installer_path: &PathBuf) -> Result<(), String> {
+        let install_dir = updater::installed_dir_from_manifest(st.store.dir())
+            .unwrap_or_else(paths::exe_dir);
+        updater::launch_installer_upgrade(
+            installer_path,
+            &install_dir,
+            st.store.dir(),
+            Some(std::process::id()),
+            CURRENT_VERSION,
+            &release.version,
+            false,
+        )
+    }
+
+    fn handle_update_results(st: &mut DaemonState) {
+        let items: Vec<UpdateJobResult> = st
+            .update_inbox
+            .lock()
+            .map(|mut g| g.drain(..).collect())
+            .unwrap_or_default();
+
+        for item in items {
+            st.update_busy = false;
+            match item {
+                UpdateJobResult::Checked { manual, outcome } => match outcome {
+                    Ok(CheckOutcome::UpdateAvailable(rel)) => {
+                        let ver = rel.version.clone();
+                        st.available_update = Some(rel.clone());
+                        let installed_copy = updater::is_installed_copy(st.store.dir());
+                        if !manual && st.cfg.updates.mode == UpdateMode::AutoInstall && installed_copy {
+                            start_update_download(st, rel, false);
+                        } else if manual || st.notified_version.as_deref() != Some(&ver) {
+                            st.notified_version = Some(ver.clone());
+                            show_tray_balloon(
+                                st,
+                                "ReCircles Update Available",
+                                &format!(
+                                    "Version v{ver} is available. Right-click the tray icon -> Updates -> Install Update."
+                                ),
+                            );
+                        }
+                    }
+                    Ok(CheckOutcome::UpToDate { current, .. }) => {
+                        st.available_update = None;
+                        if manual {
+                            show_tray_balloon(
+                                st,
+                                "ReCircles is Up to Date",
+                                &format!("You are running the latest version (v{current})."),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("ReCircles Daemon: update check failed: {err}");
+                        if manual {
+                            show_tray_balloon(st, "Update Check Failed", &err);
+                        }
+                    }
+                },
+                UpdateJobResult::Downloaded {
+                    manual,
+                    release,
+                    result,
+                } => match result {
+                    Ok(installer_path) => {
+                        if !manual && !find_ui_hwnd().is_null() {
+                            // Wait until the ring UI is closed/idle before upgrading automatically
+                            st.pending_auto_install = Some((release, installer_path));
+                            unsafe {
+                                SetTimer(st.hwnd, TIMER_IDLE_APPLY, 10_000, None);
+                            }
+                        } else {
+                            match try_launch_upgrade(st, &release, &installer_path) {
+                                Ok(()) => {
+                                    // Exit gracefully so the 3D updater overlay can replace our binary cleanly
+                                    unsafe {
+                                        PostMessageW(st.hwnd, WM_APP_QUIT_DAEMON, 0, 0);
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("ReCircles Daemon: failed launching updater: {err}");
+                                    if manual {
+                                        show_tray_balloon(st, "Update Failed", &err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("ReCircles Daemon: update download failed: {err}");
+                        if manual {
+                            show_tray_balloon(st, "Update Download Failed", &err);
+                        }
+                    }
+                },
+            }
+        }
+        update_tray_tooltip(st);
+    }
+
+    fn set_update_mode(st: &mut DaemonState, mode: UpdateMode) {
+        if st.cfg.updates.mode == mode {
+            return;
+        }
+        st.cfg.updates.mode = mode;
+        let _ = st.store.save(&st.cfg);
+        schedule_update_timer(st);
+        update_tray_tooltip(st);
+        if mode == UpdateMode::AutoInstall
+            && let Some(rel) = st.available_update.clone()
+            && updater::is_installed_copy(st.store.dir())
+        {
+            start_update_download(st, rel, false);
+        }
+    }
+
+    fn toggle_prereleases(st: &mut DaemonState) {
+        st.cfg.updates.include_prereleases = !st.cfg.updates.include_prereleases;
+        let _ = st.store.save(&st.cfg);
+        if st.cfg.updates.mode != UpdateMode::Manual {
+            start_update_check(st, false);
+        }
     }
 
     fn unregister_all_hotkeys(st: &mut DaemonState) {
@@ -332,6 +564,10 @@ mod win_daemon {
         main_kb: String,
         builtin_entries: Vec<(String, String)>,
         custom_entries: Vec<(String, String)>,
+        update_mode: UpdateMode,
+        include_prereleases: bool,
+        update_busy: bool,
+        available_version: Option<String>,
     }
 
     fn snapshot_tray_menu(st: &DaemonState) -> TrayMenuSnapshot {
@@ -368,6 +604,10 @@ mod win_daemon {
             main_kb,
             builtin_entries,
             custom_entries,
+            update_mode: st.cfg.updates.mode,
+            include_prereleases: st.cfg.updates.include_prereleases,
+            update_busy: st.update_busy,
+            available_version: st.available_update.as_ref().map(|r| r.version.clone()),
         }
     }
 
@@ -385,6 +625,22 @@ mod win_daemon {
         };
 
         append(CMD_OPEN_MAIN, &format!("Open ReCircles ({})", snap.main_kb));
+        if let Some(ver) = &snap.available_version {
+            let lbl = if snap.update_busy {
+                format!("Downloading Update v{ver}…")
+            } else {
+                format!("Install Update (v{ver})")
+            };
+            let w = to_wide_nul(&lbl);
+            let flags = if snap.update_busy {
+                MF_STRING | MF_GRAYED
+            } else {
+                MF_STRING
+            };
+            unsafe {
+                AppendMenuW(menu, flags, CMD_UPDATE_INSTALL as usize, w.as_ptr());
+            }
+        }
         unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         }
@@ -411,6 +667,87 @@ mod win_daemon {
         unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         }
+
+        // Updates submenu (Check now, Install if available, Mode selector, Beta toggle)
+        let updates_menu = unsafe { CreatePopupMenu() };
+        if !updates_menu.is_null() {
+            let append_sub = |flags: u32, id: u32, text: &str| {
+                let w = to_wide_nul(text);
+                unsafe {
+                    AppendMenuW(updates_menu, flags, id as usize, w.as_ptr());
+                }
+            };
+            if let Some(ver) = &snap.available_version {
+                append_sub(
+                    if snap.update_busy {
+                        MF_STRING | MF_GRAYED
+                    } else {
+                        MF_STRING
+                    },
+                    CMD_UPDATE_INSTALL,
+                    &format!("Install Update (v{ver})"),
+                );
+            }
+            append_sub(
+                if snap.update_busy {
+                    MF_STRING | MF_GRAYED
+                } else {
+                    MF_STRING
+                },
+                CMD_UPDATE_CHECK,
+                if snap.update_busy {
+                    "Checking for Updates…"
+                } else {
+                    "Check for Updates"
+                },
+            );
+            unsafe {
+                AppendMenuW(updates_menu, MF_SEPARATOR, 0, std::ptr::null());
+            }
+            let mode_flag = |m: UpdateMode| {
+                if snap.update_mode == m {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                }
+            };
+            append_sub(
+                mode_flag(UpdateMode::AutoInstall),
+                CMD_UPDATE_MODE_AUTO,
+                "Auto-install Updates",
+            );
+            append_sub(
+                mode_flag(UpdateMode::Notify),
+                CMD_UPDATE_MODE_NOTIFY,
+                "Notify Only",
+            );
+            append_sub(
+                mode_flag(UpdateMode::Manual),
+                CMD_UPDATE_MODE_MANUAL,
+                "Manual Only",
+            );
+            unsafe {
+                AppendMenuW(updates_menu, MF_SEPARATOR, 0, std::ptr::null());
+            }
+            append_sub(
+                if snap.include_prereleases {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                },
+                CMD_UPDATE_PRERELEASE,
+                "Include Beta / Pre-releases",
+            );
+            let sub_title = match &snap.available_version {
+                Some(ver) => format!("Updates (v{ver} available)"),
+                None => format!("Updates (v{CURRENT_VERSION})"),
+            };
+            let sub_w = to_wide_nul(&sub_title);
+            unsafe {
+                AppendMenuW(menu, MF_POPUP, updates_menu as usize, sub_w.as_ptr());
+            }
+        }
+
         append(CMD_RELOAD, "Reload Hotkeys & Config");
         append(CMD_EXIT, "Exit Daemon");
 
@@ -438,6 +775,50 @@ mod win_daemon {
             0 => {}
             CMD_OPEN_MAIN => {
                 let _ = launch_ui_detached(&paths::exe_dir(), None);
+            }
+            CMD_UPDATE_CHECK => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        start_update_check(st, true);
+                    }
+                });
+            }
+            CMD_UPDATE_INSTALL => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut()
+                        && let Some(rel) = st.available_update.clone()
+                    {
+                        start_update_download(st, rel, true);
+                    }
+                });
+            }
+            CMD_UPDATE_MODE_AUTO => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        set_update_mode(st, UpdateMode::AutoInstall);
+                    }
+                });
+            }
+            CMD_UPDATE_MODE_NOTIFY => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        set_update_mode(st, UpdateMode::Notify);
+                    }
+                });
+            }
+            CMD_UPDATE_MODE_MANUAL => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        set_update_mode(st, UpdateMode::Manual);
+                    }
+                });
+            }
+            CMD_UPDATE_PRERELEASE => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        toggle_prereleases(st);
+                    }
+                });
             }
             CMD_RELOAD => {
                 unsafe {
@@ -474,10 +855,14 @@ mod win_daemon {
     }
 
     fn update_tray_tooltip(st: &DaemonState) {
-        let text = if st.failed_hotkeys.is_empty() {
-            format!("ReCircles Daemon ({} hotkeys)", st.hotkeys.len())
-        } else {
+        let text = if !st.failed_hotkeys.is_empty() {
             format!("ReCircles Daemon (failed: {})", st.failed_hotkeys.join(", "))
+        } else if st.update_busy {
+            "ReCircles Daemon (checking/downloading update…)".to_string()
+        } else if let Some(rel) = &st.available_update {
+            format!("ReCircles Daemon (update v{} available)", rel.version)
+        } else {
+            format!("ReCircles Daemon ({} hotkeys)", st.hotkeys.len())
         };
         let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -487,6 +872,24 @@ mod win_daemon {
         let tip = to_wide_nul(&text);
         let n = tip.len().min(nid.szTip.len().saturating_sub(1));
         nid.szTip[..n].copy_from_slice(&tip[..n]);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    fn show_tray_balloon(st: &DaemonState, title: &str, body: &str) {
+        let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = st.hwnd;
+        nid.uID = TRAY_UID;
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        let title_w = to_wide_nul(title);
+        let tn = title_w.len().min(nid.szInfoTitle.len().saturating_sub(1));
+        nid.szInfoTitle[..tn].copy_from_slice(&title_w[..tn]);
+        let body_w = to_wide_nul(body);
+        let bn = body_w.len().min(nid.szInfo.len().saturating_sub(1));
+        nid.szInfo[..bn].copy_from_slice(&body_w[..bn]);
         unsafe {
             Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -538,6 +941,51 @@ mod win_daemon {
                         trim_working_set();
                     }
                 });
+                0
+            }
+            WM_APP_CHECK_UPDATES => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        start_update_check(st, wparam != 0);
+                    }
+                });
+                0
+            }
+            WM_APP_UPDATE_RESULT => {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        handle_update_results(st);
+                        trim_working_set();
+                    }
+                });
+                0
+            }
+            WM_TIMER => {
+                if wparam == TIMER_UPDATE_CHECK {
+                    STATE.with(|slot| {
+                        if let Some(st) = slot.borrow_mut().as_mut()
+                            && st.cfg.updates.mode != UpdateMode::Manual
+                        {
+                            start_update_check(st, false);
+                        }
+                    });
+                } else if wparam == TIMER_IDLE_APPLY {
+                    STATE.with(|slot| {
+                        if let Some(st) = slot.borrow_mut().as_mut()
+                            && find_ui_hwnd().is_null()
+                            && let Some((rel, path)) = st.pending_auto_install.take()
+                        {
+                            unsafe {
+                                KillTimer(st.hwnd, TIMER_IDLE_APPLY);
+                            }
+                            if try_launch_upgrade(st, &rel, &path).is_ok() {
+                                unsafe {
+                                    PostMessageW(st.hwnd, WM_APP_QUIT_DAEMON, 0, 0);
+                                }
+                            }
+                        }
+                    });
+                }
                 0
             }
             WM_APP_QUIT_DAEMON => {

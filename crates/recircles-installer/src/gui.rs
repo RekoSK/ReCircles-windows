@@ -2,8 +2,9 @@
 pub mod win_gui {
     use crate::d2d::{D2dCanvas, D2dColor, D2dGradStop};
     use crate::engine::{
-        InstallOptions, InstallSummary, NavPreset, SUBMENU_EXCLUSION_WARNING,
-        enforce_mandatory_submenus, execute_install, execute_uninstall, load_existing_manifest,
+        InstallOptions, InstallSummary, NavPreset, SUBMENU_EXCLUSION_WARNING, UpgradeOptions,
+        UpgradeProgress, enforce_mandatory_submenus, execute_install, execute_uninstall,
+        execute_upgrade, load_existing_manifest,
     };
     use crate::icons::{UiGlyph, glyph_cmds};
     use crate::spring::{
@@ -12,7 +13,7 @@ pub mod win_gui {
     };
     use crate::vsync::{VsyncPacer, WM_APP_INSTALL_DONE, WM_APP_TICK};
     use recircles_core::config::{
-        AppearanceConfig, KeyList, KeybindsConfig, LoadingStyle, OverflowLayout,
+        AppearanceConfig, KeyList, KeybindsConfig, LoadingStyle, OverflowLayout, UpdateMode,
     };
     use recircles_core::ipc::{WM_APP_CAPTURE_KEY, win::to_wide_nul};
     use recircles_core::modules::BuiltinSubmenu;
@@ -62,7 +63,8 @@ pub mod win_gui {
         SystemParametersInfoW, TranslateMessage, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY,
         WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
         WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
-        WNDCLASSEXW, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+        WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
+        WS_SYSMENU,
     };
 
     const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
@@ -318,6 +320,7 @@ pub mod win_gui {
         ToggleStartup,
         ToggleShortcuts,
         ToggleLaunchDaemon,
+        SetUpdateMode(UpdateMode),
         UninstallExisting,
         ConfirmUninstall,
         CancelUninstall,
@@ -436,6 +439,7 @@ pub mod win_gui {
         step_pill_y: AppleSpring,
         nav_seg_x: AppleSpring,
         layout_seg_x: AppleSpring,
+        update_seg_x: AppleSpring,
         primary_press: AppleSpring,
         back_press: AppleSpring,
         toggle_startup: AppleSpring,
@@ -686,6 +690,7 @@ pub mod win_gui {
             {
                 opts.appearance = cfg.appearance.clone();
                 opts.keybinds = cfg.keybinds.clone();
+                opts.update_mode = cfg.updates.mode;
                 if let Some(m) = cfg.keybinds.main_menu.primary() {
                     opts.main_hotkey = m.to_string();
                 }
@@ -860,6 +865,7 @@ pub mod win_gui {
             toggle_number_shortcuts: AppleSpring::new(if opts.keybinds.number_shortcuts { 1.0 } else { 0.0 }, 1.0, 0.16),
             nav_seg_x: AppleSpring::new(if opts.nav_preset == NavPreset::Vim { 1.0 } else { 0.0 }, 1.0, 0.18),
             layout_seg_x: AppleSpring::new(if opts.appearance.layout == OverflowLayout::Ring { 1.0 } else { 0.0 }, 1.0, 0.18),
+            update_seg_x: AppleSpring::new(update_mode_index(opts.update_mode), 1.0, 0.18),
             opts,
             install_dir_str: dir_str,
             dir_error: None,
@@ -1936,6 +1942,7 @@ pub mod win_gui {
         active |= st.step_pill_y.step(dt, rm);
         active |= st.nav_seg_x.step(dt, rm);
         active |= st.layout_seg_x.step(dt, rm);
+        active |= st.update_seg_x.step(dt, rm);
         active |= st.primary_press.step(dt, rm);
         active |= st.back_press.step(dt, rm);
         active |= st.toggle_startup.step(dt, rm);
@@ -2033,6 +2040,10 @@ pub mod win_gui {
                 st.opts.launch_daemon = !st.opts.launch_daemon;
                 st.toggle_daemon
                     .set_target(if st.opts.launch_daemon { 1.0 } else { 0.0 });
+            }
+            ClickAction::SetUpdateMode(mode) => {
+                st.opts.update_mode = mode;
+                st.update_seg_x.set_target(update_mode_index(mode));
             }
             ClickAction::UninstallExisting => {
                 st.editing_dir = false;
@@ -3504,7 +3515,7 @@ pub mod win_gui {
         );
 
         // Integration Toggles
-        let ty0 = input_y + 66.0;
+        let ty0 = input_y + 52.0;
         st.canvas.draw_text(
             "Windows Integration",
             FONT_SECONDARY,
@@ -3545,14 +3556,14 @@ pub mod win_gui {
         ];
 
         for (i, (id, lbl, desc, anim, act)) in toggles.into_iter().enumerate() {
-            let ry = ty0 + 24.0 + i as f64 * 62.0;
+            let ry = ty0 + 22.0 + i as f64 * 52.0;
             draw_toggle_card(
                 st,
                 id,
                 x,
                 ry,
                 w,
-                54.0,
+                46.0,
                 lbl,
                 desc,
                 anim,
@@ -3563,11 +3574,62 @@ pub mod win_gui {
             );
         }
 
+        // Automatic Updates mode selector (Auto-install | Notify | Manual)
+        let upd_y = ty0 + 22.0 + 3.0 * 52.0 + 10.0;
+        st.canvas.draw_text(
+            "Automatic Updates",
+            FONT_SECONDARY,
+            true,
+            x + 2.0,
+            upd_y,
+            150.0,
+            18.0,
+            0,
+            3,
+            1,
+            D2dColor::from_rgb(pal.text_primary, 0.92 * alpha),
+            None,
+        );
+        st.canvas.draw_text(
+            st.opts.update_mode.description(),
+            FONT_CAPTION,
+            false,
+            x + 150.0,
+            upd_y + 1.0,
+            w - 150.0,
+            16.0,
+            2,
+            3,
+            1,
+            D2dColor::from_rgb(pal.text_muted, 0.78 * alpha),
+            None,
+        );
+        let seg_y = upd_y + 22.0;
+        let seg_h = 34.0;
+        draw_segmented_control_3(
+            st,
+            215,
+            x,
+            seg_y,
+            w,
+            seg_h,
+            ["Auto-install", "Notify Only", "Manual Only"],
+            st.update_seg_x.value,
+            [
+                ClickAction::SetUpdateMode(UpdateMode::AutoInstall),
+                ClickAction::SetUpdateMode(UpdateMode::Notify),
+                ClickAction::SetUpdateMode(UpdateMode::Manual),
+            ],
+            pal,
+            alpha,
+            interactive,
+        );
+
         // Destructive uninstall action (only if existing install detected)
         if st.existing_installed {
-            let uy = ty0 + 24.0 + 3.0 * 62.0 + 10.0;
+            let uy = seg_y + seg_h + 10.0;
             let uw = 198.0;
-            let uh = 36.0;
+            let uh = 32.0;
             let hovered = st.hover_id == Some(220);
             let danger = (0.95, 0.42, 0.44);
             st.canvas.fill_rounded_rect_solid(
@@ -5203,21 +5265,18 @@ pub mod win_gui {
             D2dColor::from_rgb(pal.text_primary, alpha),
             None,
         );
-        let mut flags = Vec::new();
+        let mut flags: Vec<String> = Vec::new();
         if st.opts.start_with_windows {
-            flags.push("Start with Windows");
+            flags.push("Start with Windows".into());
         }
         if st.opts.create_shortcuts {
-            flags.push("Start Menu Shortcuts");
+            flags.push("Start Menu Shortcuts".into());
         }
         if st.opts.launch_daemon {
-            flags.push("Launch Daemon");
+            flags.push("Launch Daemon".into());
         }
-        let flag_line = if flags.is_empty() {
-            "Manual launch only".to_string()
-        } else {
-            flags.join("  ·  ")
-        };
+        flags.push(format!("Updates: {}", st.opts.update_mode.short_label()));
+        let flag_line = flags.join("  ·  ");
         st.canvas.draw_text(
             &flag_line,
             FONT_CAPTION,
@@ -6364,6 +6423,859 @@ pub mod win_gui {
         }
     }
 
+    fn update_mode_index(mode: UpdateMode) -> f64 {
+        match mode {
+            UpdateMode::AutoInstall => 0.0,
+            UpdateMode::Notify => 1.0,
+            UpdateMode::Manual => 2.0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_segmented_control_3(
+        st: &mut WizardState,
+        base_id: u64,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        labels: [&str; 3],
+        pos: f64,
+        actions: [ClickAction; 3],
+        pal: &ThemePalette,
+        alpha: f64,
+        interactive: bool,
+    ) {
+        let r = 10.0;
+        st.canvas.fill_rounded_rect_solid(
+            x,
+            y,
+            w,
+            h,
+            r,
+            D2dColor::from_rgb(pal.capsule_bottom, lerp(0.72, 0.80, pal.is_light) * alpha),
+        );
+        st.canvas.stroke_rounded_rect(
+            x,
+            y,
+            w,
+            h,
+            r,
+            1.0,
+            D2dColor::from_rgb(pal.capsule_border, 0.26 * alpha),
+        );
+
+        let inset = 3.0;
+        let seg_w = (w - inset * 2.0) / 3.0;
+        let seg_h = h - inset * 2.0;
+        let clamped = pos.clamp(0.0, 2.0);
+        let pill_x = x + inset + clamped * seg_w;
+        let pill_y = y + inset;
+
+        st.canvas.fill_rounded_rect_solid(
+            pill_x,
+            pill_y,
+            seg_w,
+            seg_h,
+            r - 2.5,
+            D2dColor::from_rgb(pal.accent, 0.20 * alpha),
+        );
+        st.canvas.stroke_rounded_rect(
+            pill_x,
+            pill_y,
+            seg_w,
+            seg_h,
+            r - 2.5,
+            1.0,
+            D2dColor::from_rgb(pal.accent, 0.62 * alpha),
+        );
+
+        for i in 0..3 {
+            let dist = (clamped - i as f64).abs().min(1.0);
+            let col = lerp_rgb(pal.text_primary, pal.text_muted, dist);
+            let sx = x + inset + i as f64 * seg_w;
+            st.canvas.draw_text(
+                labels[i],
+                FONT_SECONDARY,
+                dist < 0.5,
+                sx,
+                y,
+                seg_w,
+                h,
+                1,
+                3,
+                1,
+                D2dColor::from_rgb(col, alpha),
+                None,
+            );
+            if interactive {
+                st.hits.push(HitRegion {
+                    id: base_id + i as u64,
+                    x: x + i as f64 * (w / 3.0),
+                    y,
+                    w: w / 3.0,
+                    h,
+                    action: actions[i].clone(),
+                    cursor: CursorKind::Hand,
+                    hover_submenu: None,
+                });
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Frameless 3D Rotating Ring + Progress Bar "Updating" Overlay
+    // -----------------------------------------------------------------------
+
+    const UPD_W: f64 = 400.0;
+    const UPD_H: f64 = 356.0;
+
+    struct UpdaterShared {
+        progress: f32,
+        status: String,
+        done: Option<Result<(), String>>,
+    }
+
+    struct UpdaterOverlayState {
+        canvas: D2dCanvas,
+        pacer: VsyncPacer,
+        scale: f64,
+        palette: ThemePalette,
+        blur_pct: u8,
+        translucency_pct: u8,
+        high_contrast: bool,
+        shared: Arc<Mutex<UpdaterShared>>,
+        progress_spring: AppleSpring,
+        open_alpha: AppleSpring,
+        closing: bool,
+        finished_at: Option<Instant>,
+        tumble_time: f64,
+        last_tick: Instant,
+        version_subtitle: String,
+        preview_mode: bool,
+        exit_code: i32,
+    }
+
+    thread_local! {
+        static UPD_STATE: RefCell<Option<UpdaterOverlayState>> = const { RefCell::new(None) };
+    }
+
+    fn load_theme_for_updater(config_dir: &std::path::Path) -> (ThemePalette, u8, u8, bool) {
+        let store = recircles_core::config::ConfigStore::in_dir(config_dir.to_path_buf());
+        let detected = recircles_core::modules::InstalledModules::detect_default();
+        if let Ok(cfg) = store.load_or_create(&detected) {
+            let colors = cfg.effective_colors(&store);
+            return (
+                ThemePalette::from_colors(&colors),
+                cfg.appearance.blur,
+                cfg.appearance.translucency,
+                cfg.appearance.high_contrast,
+            );
+        }
+        let def = builtin_theme("default").map(|b| b.colors).unwrap_or_default();
+        (ThemePalette::from_colors(&def), 20, 60, false)
+    }
+
+    pub fn run_updater_preview(
+        config_dir: PathBuf,
+        progress: f32,
+        from_version: Option<String>,
+        to_version: Option<String>,
+    ) -> i32 {
+        let shared = Arc::new(Mutex::new(UpdaterShared {
+            progress: progress.clamp(0.0, 1.0),
+            status: "Updating core binaries…".into(),
+            done: None,
+        }));
+        let subtitle = match (from_version, to_version) {
+            (Some(f), Some(t)) => format!("v{f}  →  v{t}"),
+            (None, Some(t)) => format!("v{t}"),
+            _ => format!("v{}", env!("CARGO_PKG_VERSION")),
+        };
+        run_updater_window(config_dir, shared, subtitle, true)
+    }
+
+    pub fn run_updater_overlay(
+        opts: UpgradeOptions,
+        from_version: Option<String>,
+        to_version: Option<String>,
+    ) -> i32 {
+        let config_dir = opts.config_dir.clone();
+        let target_ver = to_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let subtitle = match from_version {
+            Some(f) if !f.trim().is_empty() && f.trim() != target_ver.trim() => {
+                format!("v{}  →  v{}", f.trim(), target_ver.trim())
+            }
+            _ => format!("v{}", target_ver.trim()),
+        };
+        let shared = Arc::new(Mutex::new(UpdaterShared {
+            progress: 0.06,
+            status: "Preparing update…".into(),
+            done: None,
+        }));
+        let shared_bg = shared.clone();
+        std::thread::spawn(move || {
+            let res = execute_upgrade(&opts, None, |prog: UpgradeProgress| {
+                if let Ok(mut g) = shared_bg.lock() {
+                    g.progress = prog.fraction.clamp(0.0, 1.0);
+                    g.status = prog.status.to_string();
+                }
+            });
+            if let Ok(mut g) = shared_bg.lock() {
+                match res {
+                    Ok(_) => {
+                        g.progress = 1.0;
+                        g.status = "Updated!".into();
+                        g.done = Some(Ok(()));
+                    }
+                    Err(e) => {
+                        g.status = format!("Update failed: {e}");
+                        g.done = Some(Err(e));
+                    }
+                }
+            }
+        });
+        run_updater_window(config_dir, shared, subtitle, false)
+    }
+
+    fn run_updater_window(
+        config_dir: PathBuf,
+        shared: Arc<Mutex<UpdaterShared>>,
+        version_subtitle: String,
+        preview_mode: bool,
+    ) -> i32 {
+        unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let (palette, blur_pct, translucency_pct, high_contrast) =
+            load_theme_for_updater(&config_dir);
+
+        let hinst = unsafe { GetModuleHandleW(ptr::null()) };
+        let cls = to_wide_nul("ReCirclesUpdaterRingOverlay");
+        let title = to_wide_nul("Updating ReCircles");
+        let (app_icon, app_icon_sm) = recircles_core::app_icon::win::load_or_create_app_icons();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(updater_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: app_icon,
+            hCursor: unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) },
+            hbrBackground: ptr::null_mut(),
+            lpszMenuName: ptr::null(),
+            lpszClassName: cls.as_ptr(),
+            hIconSm: app_icon_sm,
+        };
+        unsafe { RegisterClassExW(&wc) };
+
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut pt) };
+        let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        unsafe { GetMonitorInfoW(hmon, &mut mi) };
+        let work = mi.rcWork;
+        let mon = mi.rcMonitor;
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                cls.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                work.left,
+                work.top,
+                UPD_W as i32,
+                UPD_H as i32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                hinst,
+                ptr::null(),
+            )
+        };
+        if hwnd.is_null() {
+            return 1;
+        }
+
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f64;
+        let scale = (dpi / 96.0).clamp(1.0, 4.0);
+        let phys_w = (UPD_W * scale).round() as i32;
+        let phys_h = (UPD_H * scale).round() as i32;
+        let cx = work.left + ((work.right - work.left) - phys_w) / 2;
+        let cy = work.top + ((work.bottom - work.top) - phys_h) / 2;
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                ptr::null_mut(),
+                cx,
+                cy,
+                phys_w,
+                phys_h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+
+        let Some(mut canvas) = D2dCanvas::new(hwnd, phys_w, phys_h, scale) else {
+            unsafe { DestroyWindow(hwnd) };
+            return 1;
+        };
+
+        let mon_w = (mon.right - mon.left).max(1);
+        let mon_h = (mon.bottom - mon.top).max(1);
+        let blur_t = f64::from(blur_pct) / 100.0;
+        let blur_sigma = ((0.35 + blur_t.powf(1.35) * 37.65) * scale).clamp(0.25, 64.0);
+        let blur_sat = 1.0 + 0.24 * blur_t;
+        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, blur_sigma) {
+            let _ = canvas.set_backdrop_blur(blur_sigma, blur_sat);
+            canvas.set_backdrop_origin((cx - mon.left) as f64, (cy - mon.top) as f64);
+        }
+
+        let init_prog = shared.lock().map(|g| g.progress as f64).unwrap_or(0.0);
+        let pacer = VsyncPacer::start(hwnd);
+        pacer.set_animating(true);
+
+        let mut st = UpdaterOverlayState {
+            canvas,
+            pacer,
+            scale,
+            palette,
+            blur_pct,
+            translucency_pct,
+            high_contrast,
+            shared,
+            progress_spring: AppleSpring::new(if preview_mode { init_prog } else { 0.0 }, 1.0, 0.28),
+            open_alpha: AppleSpring::new(if preview_mode { 1.0 } else { 0.05 }, 1.0, 0.22),
+            closing: false,
+            finished_at: None,
+            tumble_time: if preview_mode { 0.72 } else { 0.0 },
+            last_tick: Instant::now(),
+            version_subtitle,
+            preview_mode,
+            exit_code: 0,
+        };
+        st.open_alpha.set_target(1.0);
+        st.progress_spring.set_target(init_prog);
+        paint_updater_overlay(&mut st);
+
+        unsafe {
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+        }
+
+        UPD_STATE.with(|slot| *slot.borrow_mut() = Some(st));
+
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        UPD_STATE.with(|slot| slot.borrow_mut().take().map(|s| s.exit_code).unwrap_or(0))
+    }
+
+    fn draw_3d_ring_at(
+        canvas: &D2dCanvas,
+        pal: &ThemePalette,
+        cx: f64,
+        cy: f64,
+        outer_r: f64,
+        inner_r: f64,
+        half_thickness: f64,
+        tumble_time: f64,
+        alpha: f64,
+    ) {
+        let rot_x = (tumble_time * 2.1).sin() * 0.50;
+        let rot_y = (tumble_time * 1.65 + 0.5).cos() * 0.54;
+        let rot_z = (tumble_time * 1.45) % TAU;
+        let (sx, cx_r) = rot_x.sin_cos();
+        let (sy, cy_r) = rot_y.sin_cos();
+        let (sz, cz) = rot_z.sin_cos();
+        let r = [
+            [cz * cy_r, cz * sy * sx - sz * cx_r, cz * sy * cx_r + sz * sx],
+            [sz * cy_r, sz * sy * sx + cz * cx_r, sz * sy * cx_r - cz * sx],
+            [-sy, cy_r * sx, cy_r * cx_r],
+        ];
+
+        #[derive(Clone, Copy)]
+        struct Vec3(f64, f64, f64);
+        impl Vec3 {
+            fn dot(self, o: Self) -> f64 {
+                self.0 * o.0 + self.1 * o.1 + self.2 * o.2
+            }
+            fn normalize(self) -> Self {
+                let l = self.dot(self).sqrt();
+                if l > 0.0 {
+                    Self(self.0 / l, self.1 / l, self.2 / l)
+                } else {
+                    Self(0.0, 0.0, 1.0)
+                }
+            }
+        }
+
+        let rot = |v: Vec3| {
+            Vec3(
+                r[0][0] * v.0 + r[0][1] * v.1 + r[0][2] * v.2,
+                r[1][0] * v.0 + r[1][1] * v.1 + r[1][2] * v.2,
+                r[2][0] * v.0 + r[2][1] * v.1 + r[2][2] * v.2,
+            )
+        };
+        let proj = |p: Vec3| {
+            let w = rot(p);
+            let persp = PERSPECTIVE_D / (PERSPECTIVE_D - w.2);
+            (w.0 * persp, w.1 * persp, w.2)
+        };
+        let cam = Vec3(
+            r[2][0] * PERSPECTIVE_D,
+            r[2][1] * PERSPECTIVE_D,
+            r[2][2] * PERSPECTIVE_D,
+        );
+
+        let mut outer_f = [(0.0, 0.0, 0.0); RING_SEGMENTS];
+        let mut outer_b = [(0.0, 0.0, 0.0); RING_SEGMENTS];
+        let mut inner_f = [(0.0, 0.0, 0.0); RING_SEGMENTS];
+        let mut inner_b = [(0.0, 0.0, 0.0); RING_SEGMENTS];
+        for (i, &(ca, sa)) in RING_COS_SIN.iter().enumerate() {
+            outer_f[i] = proj(Vec3(outer_r * ca, outer_r * sa, half_thickness));
+            outer_b[i] = proj(Vec3(outer_r * ca, outer_r * sa, -half_thickness));
+            inner_f[i] = proj(Vec3(inner_r * ca, inner_r * sa, half_thickness));
+            inner_b[i] = proj(Vec3(inner_r * ca, inner_r * sa, -half_thickness));
+        }
+
+        let light = Vec3(-0.42, -0.72, 0.80).normalize();
+        let half_vec = Vec3(light.0, light.1, light.2 + 1.0).normalize();
+
+        let shade_outer = |ca: f64, sa: f64| -> Rgb {
+            let n = rot(Vec3(ca, sa, 0.0));
+            let diff = n.dot(light).max(0.0);
+            let spec = n.dot(half_vec).max(0.0).powf(12.0);
+            let base = lerp_rgb(pal.ring_bottom, pal.ring_top, 0.20 + 0.80 * diff);
+            let lit = lerp_rgb(base, pal.rim_top, 0.28 * diff + 0.48 * spec);
+            lerp_rgb(lit, pal.accent, 0.24 * diff + 0.46 * spec)
+        };
+        let shade_inner = |ca: f64, sa: f64| -> Rgb {
+            let n = rot(Vec3(-ca, -sa, 0.0));
+            let diff = n.dot(light).max(0.0);
+            let spec = n.dot(half_vec).max(0.0).powf(10.0);
+            let base = lerp_rgb(pal.ring_mid, pal.ring_top, 0.12 + 0.72 * diff);
+            let lit = lerp_rgb(base, pal.rim_bottom, 0.20 * diff + 0.34 * spec);
+            lerp_rgb(lit, pal.accent, 0.18 * diff + 0.34 * spec)
+        };
+
+        canvas.save();
+        canvas.translate(cx, cy);
+
+        #[derive(Clone, Copy)]
+        struct WallQuad {
+            z: f64,
+            pts: [(f64, f64); 4],
+            rgb: Rgb,
+        }
+        let mut quads = [WallQuad {
+            z: 0.0,
+            pts: [(0.0, 0.0); 4],
+            rgb: (0.0, 0.0, 0.0),
+        }; RING_SEGMENTS * 2];
+        let mut quad_len = 0usize;
+        for (i, &(ca, sa)) in RING_MID_COS_SIN.iter().enumerate() {
+            let j = (i + 1) % RING_SEGMENTS;
+            if cam.0 * ca + cam.1 * sa - outer_r > -4.0 {
+                let (p0, p1, p2, p3) = (outer_f[i], outer_f[j], outer_b[j], outer_b[i]);
+                quads[quad_len] = WallQuad {
+                    z: 0.25 * (p0.2 + p1.2 + p2.2 + p3.2),
+                    pts: [(p0.0, p0.1), (p1.0, p1.1), (p2.0, p2.1), (p3.0, p3.1)],
+                    rgb: shade_outer(ca, sa),
+                };
+                quad_len += 1;
+            }
+            if -(cam.0 * ca + cam.1 * sa) + inner_r > -4.0 {
+                let (p0, p1, p2, p3) = (inner_f[i], inner_f[j], inner_b[j], inner_b[i]);
+                quads[quad_len] = WallQuad {
+                    z: 0.25 * (p0.2 + p1.2 + p2.2 + p3.2),
+                    pts: [(p0.0, p0.1), (p1.0, p1.1), (p2.0, p2.1), (p3.0, p3.1)],
+                    rgb: shade_inner(ca, sa),
+                };
+                quad_len += 1;
+            }
+        }
+        let active_quads = &mut quads[..quad_len];
+        active_quads.sort_by(|a, b| a.z.total_cmp(&b.z));
+        if !active_quads.is_empty() {
+            canvas.push_opacity_layer(
+                -outer_r - 20.0,
+                -outer_r - 20.0,
+                outer_r * 2.0 + 40.0,
+                outer_r * 2.0 + 40.0,
+                0.90 * alpha,
+            );
+            for q in active_quads {
+                canvas.fill_polygon(&q.pts, D2dColor::from_rgb(q.rgb, 1.0));
+            }
+            canvas.pop_layer();
+        }
+
+        let front_pos = cam.2 >= 0.0;
+        let src_outer = if front_pos { &outer_f } else { &outer_b };
+        let src_inner = if front_pos { &inner_f } else { &inner_b };
+        let mut face_outer = [(0.0, 0.0); RING_SEGMENTS];
+        let mut face_inner = [(0.0, 0.0); RING_SEGMENTS];
+        for i in 0..RING_SEGMENTS {
+            face_outer[i] = (src_outer[i].0, src_outer[i].1);
+            face_inner[i] = (src_inner[i].0, src_inner[i].1);
+        }
+
+        let (mut gy0, mut gy1) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &(_, y) in &face_outer {
+            gy0 = gy0.min(y);
+            gy1 = gy1.max(y);
+        }
+        let stops = [
+            D2dGradStop {
+                pos: 0.0,
+                color: D2dColor::from_rgb(pal.ring_top, 0.88 * alpha),
+            },
+            D2dGradStop {
+                pos: 0.5,
+                color: D2dColor::from_rgb(pal.ring_mid, 0.82 * alpha),
+            },
+            D2dGradStop {
+                pos: 1.0,
+                color: D2dColor::from_rgb(pal.ring_bottom, 0.90 * alpha),
+            },
+        ];
+        canvas.fill_polygon_ring_linear(&face_outer, &face_inner, 0.0, gy0, 0.0, gy1, &stops);
+        canvas.stroke_polygon_ring_linear(
+            &face_outer,
+            &face_inner,
+            1.15,
+            0.0,
+            gy0,
+            0.0,
+            gy1,
+            D2dColor::from_rgb(pal.rim_top, 0.78 * alpha),
+            D2dColor::from_rgb(pal.rim_bottom, 0.34 * alpha),
+        );
+        canvas.stroke_polygon(&face_outer, 1.7, D2dColor::from_rgb(pal.accent, 0.62 * alpha));
+        canvas.restore();
+    }
+
+    fn paint_updater_overlay(st: &mut UpdaterOverlayState) {
+        let alpha = st.open_alpha.value.clamp(0.0, 1.0);
+        let pal = st.palette;
+        let (status_text, is_err) = st
+            .shared
+            .lock()
+            .map(|g| (g.status.clone(), matches!(g.done, Some(Err(_)))))
+            .unwrap_or_else(|_| ("Updating…".into(), false));
+        let prog = st.progress_spring.value.clamp(0.0, 1.0);
+        let pct = (prog * 100.0).round() as u32;
+
+        st.canvas.begin_frame(st.scale);
+
+        // 1. Frameless 3D rotating glass ring floating cleanly in the upper center
+        draw_3d_ring_at(
+            &st.canvas,
+            &pal,
+            UPD_W * 0.5,
+            134.0,
+            92.0,
+            38.0,
+            12.5,
+            st.tumble_time,
+            alpha,
+        );
+
+        // 2. Compact frosted glass pill directly underneath: "Updating" + progress bar
+        let card_w = 328.0;
+        let card_h = 74.0;
+        let card_x = (UPD_W - card_w) * 0.5;
+        let card_y = 258.0;
+        let card_r = 18.0;
+
+        st.canvas.fill_rounded_rect_shadow(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            card_r,
+            D2dColor::from_rgb(pal.shadow, 1.0),
+            alpha * 0.85,
+        );
+
+        let uses_backdrop =
+            st.canvas.has_backdrop() && !st.high_contrast && st.translucency_pct > 0 && st.blur_pct > 0;
+        if uses_backdrop {
+            st.canvas
+                .fill_rounded_rect_backdrop(card_x, card_y, card_w, card_h, card_r, 0.0, alpha);
+        }
+
+        let panel_a = if st.high_contrast {
+            0.96
+        } else {
+            (1.0 - f64::from(st.translucency_pct) / 100.0 * 0.55).clamp(0.62, 0.94)
+        };
+        let card_stops = [
+            D2dGradStop {
+                pos: 0.0,
+                color: D2dColor::from_rgb(pal.ring_top, panel_a * alpha),
+            },
+            D2dGradStop {
+                pos: 1.0,
+                color: D2dColor::from_rgb(pal.ring_bottom, (panel_a + 0.05).min(1.0) * alpha),
+            },
+        ];
+        st.canvas.fill_rounded_rect_linear(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            card_r,
+            0.0,
+            card_y,
+            0.0,
+            card_y + card_h,
+            &card_stops,
+        );
+        st.canvas.stroke_rounded_rect(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            card_r,
+            1.0,
+            D2dColor::from_rgb(
+                if is_err { (0.95, 0.42, 0.44) } else { pal.rim_top },
+                0.42 * alpha,
+            ),
+        );
+
+        let pad_x = 18.0;
+        let inner_w = card_w - pad_x * 2.0;
+
+        // Title row: "Updating" on left, percentage on right
+        let heading = if is_err {
+            "Update Failed"
+        } else if pct >= 100 {
+            "Updated"
+        } else {
+            "Updating"
+        };
+        st.canvas.draw_text(
+            heading,
+            FONT_SUBHEAD,
+            true,
+            card_x + pad_x,
+            card_y + 11.0,
+            inner_w - 46.0,
+            20.0,
+            0,
+            3,
+            1,
+            D2dColor::from_rgb(pal.text_primary, alpha),
+            None,
+        );
+        let pct_str = format!("{pct}%");
+        st.canvas.draw_text(
+            &pct_str,
+            FONT_CAPTION,
+            true,
+            card_x + card_w - pad_x - 46.0,
+            card_y + 12.0,
+            46.0,
+            18.0,
+            2,
+            3,
+            1,
+            D2dColor::from_rgb(pal.accent, 0.96 * alpha),
+            None,
+        );
+
+        // Progress bar track + glowing accent fill
+        let bar_x = card_x + pad_x;
+        let bar_y = card_y + 37.0;
+        let bar_w = inner_w;
+        let bar_h = 7.0;
+        let bar_r = bar_h * 0.5;
+        st.canvas.fill_rounded_rect_solid(
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            bar_r,
+            D2dColor::from_rgb(pal.capsule_border, 0.24 * alpha),
+        );
+        let fill_w = (bar_w * prog).clamp(if prog > 0.0 { bar_h } else { 0.0 }, bar_w);
+        if fill_w > 0.5 {
+            let accent_col = if is_err { (0.95, 0.42, 0.44) } else { pal.accent };
+            let hi = lerp_rgb(accent_col, (1.0, 1.0, 1.0), 0.24);
+            let bar_stops = [
+                D2dGradStop {
+                    pos: 0.0,
+                    color: D2dColor::from_rgb(accent_col, 0.96 * alpha),
+                },
+                D2dGradStop {
+                    pos: 1.0,
+                    color: D2dColor::from_rgb(hi, 0.98 * alpha),
+                },
+            ];
+            st.canvas.fill_rounded_rect_linear(
+                bar_x,
+                bar_y,
+                fill_w,
+                bar_h,
+                bar_r,
+                bar_x,
+                0.0,
+                bar_x + fill_w,
+                0.0,
+                &bar_stops,
+            );
+        }
+
+        // Subtitle line: active phase on left, version transition on right
+        if is_err || st.version_subtitle.is_empty() {
+            st.canvas.draw_text(
+                &status_text,
+                FONT_CAPTION,
+                false,
+                card_x + pad_x,
+                card_y + 50.0,
+                inner_w,
+                16.0,
+                0,
+                3,
+                1,
+                D2dColor::from_rgb(pal.text_muted, 0.86 * alpha),
+                None,
+            );
+        } else {
+            let left_w = inner_w * 0.52;
+            let right_w = inner_w - left_w - 6.0;
+            st.canvas.draw_text(
+                &status_text,
+                FONT_CAPTION,
+                false,
+                card_x + pad_x,
+                card_y + 50.0,
+                left_w,
+                16.0,
+                0,
+                3,
+                1,
+                D2dColor::from_rgb(pal.text_muted, 0.86 * alpha),
+                None,
+            );
+            st.canvas.draw_text(
+                &st.version_subtitle,
+                FONT_CAPTION,
+                false,
+                card_x + pad_x + left_w + 6.0,
+                card_y + 50.0,
+                right_w,
+                16.0,
+                2,
+                3,
+                1,
+                D2dColor::from_rgb(pal.text_muted, 0.78 * alpha),
+                None,
+            );
+        }
+
+        let _ = st.canvas.end_frame(0);
+    }
+
+    unsafe extern "system" fn updater_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_APP_TICK => {
+                let mut should_destroy = false;
+                UPD_STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        st.pacer.ack_tick();
+                        let now = Instant::now();
+                        let dt = (now - st.last_tick).as_secs_f64().clamp(0.0, 0.05);
+                        st.last_tick = now;
+                        st.tumble_time += dt;
+
+                        let (target_prog, done) = st
+                            .shared
+                            .lock()
+                            .map(|g| (g.progress as f64, g.done.clone()))
+                            .unwrap_or((0.0, None));
+                        st.progress_spring.set_target(target_prog);
+                        st.progress_spring.step(dt, false);
+                        st.open_alpha.step(dt, false);
+
+                        if !st.preview_mode
+                            && let Some(res) = done
+                        {
+                            if res.is_err() {
+                                st.exit_code = 1;
+                            }
+                            let hold_ms = if res.is_ok() { 550 } else { 2200 };
+                            let started = *st.finished_at.get_or_insert(now);
+                            if !st.closing
+                                && started.elapsed() >= std::time::Duration::from_millis(hold_ms)
+                            {
+                                st.closing = true;
+                                st.open_alpha.set_target(0.0);
+                            }
+                        }
+
+                        if st.closing && st.open_alpha.value <= 0.02 {
+                            st.pacer.set_animating(false);
+                            should_destroy = true;
+                        } else {
+                            paint_updater_overlay(st);
+                        }
+                    }
+                });
+                if should_destroy {
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                0
+            }
+            WM_KEYDOWN => {
+                let vk = wparam as u32;
+                let preview = UPD_STATE.with(|slot| {
+                    slot.borrow().as_ref().map(|s| s.preview_mode).unwrap_or(false)
+                });
+                if preview && vk == VK_ESCAPE as u32 {
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                0
+            }
+            WM_LBUTTONUP => {
+                let preview = UPD_STATE.with(|slot| {
+                    slot.borrow().as_ref().map(|s| s.preview_mode).unwrap_or(false)
+                });
+                if preview {
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                0
+            }
+            WM_DESTROY => {
+                UPD_STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        st.pacer.set_animating(false);
+                    }
+                });
+                unsafe { PostQuitMessage(0) };
+                0
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
     fn draw_summary_card(
         st: &WizardState,
         x: f64,
@@ -6633,6 +7545,7 @@ pub mod win_gui {
                 toggle_number_shortcuts: AppleSpring::new(1.0, 0.85, 0.26),
                 nav_seg_x: AppleSpring::new(0.0, 0.92, 0.28),
                 layout_seg_x: AppleSpring::new(0.0, 0.92, 0.28),
+                update_seg_x: AppleSpring::new(0.0, 0.92, 0.28),
                 opts,
                 install_dir_str: "C:\\Temp\\ReCircles".into(),
                 dir_error: None,

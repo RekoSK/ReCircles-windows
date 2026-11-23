@@ -8,6 +8,8 @@ pub const WM_APP_QUIT_DAEMON: u32 = 0x8000 + 103;
 pub const WM_APP_TRAY: u32 = 0x8000 + 104;
 pub const WM_APP_HOOK_HOTKEY: u32 = 0x8000 + 105;
 pub const WM_APP_CAPTURE_KEY: u32 = 0x8000 + 106;
+pub const WM_APP_UPDATE_RESULT: u32 = 0x8000 + 107;
+pub const WM_APP_CHECK_UPDATES: u32 = 0x8000 + 108;
 
 pub const COPYDATA_RUN_MENU: usize = 0x5243_0001;
 
