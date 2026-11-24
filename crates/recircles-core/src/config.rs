@@ -98,6 +98,23 @@ impl LoadingStyle {
 
 pub const DEFAULT_TRANSLUCENCY: u8 = 60;
 pub const DEFAULT_BLUR: u8 = 20;
+/// Maximum Gaussian blur standard deviation (at 100% blur, 1.0x DPI scale) in logical pixels.
+pub const MAX_BLUR_SIGMA_LOGICAL: f64 = 32.0;
+
+/// Returns linear `(blur_sigma_px, saturation)` for a `0..=100` blur percentage at `dpi_scale`.
+/// `0%` returns `None` (completely unblurred). `1..=100%` scales strictly linearly from
+/// `0.32 * dpi_scale` to `32.0 * dpi_scale`, keeping 1% subtle and 100% linear even at 200% DPI.
+pub fn linear_blur_params(blur_pct: u8, dpi_scale: f64) -> Option<(f64, f64)> {
+    let pct = blur_pct.min(100);
+    if pct == 0 {
+        return None;
+    }
+    let t = f64::from(pct) / 100.0;
+    let scale = dpi_scale.clamp(0.5, 4.0);
+    let sigma = (t * MAX_BLUR_SIGMA_LOGICAL * scale).clamp(0.05, 64.0);
+    let sat = 1.0 + 0.24 * t;
+    Some((sigma, sat))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppearanceConfig {
@@ -2118,5 +2135,23 @@ mod tests {
             serde_json::from_str(r#"{"material":"solid"}"#).unwrap();
         assert_eq!(leg_solid.translucency, 0);
         assert_eq!(leg_solid.material, Material::Solid);
+
+        // Blur sigma & saturation scale strictly linearly across 0..=100%
+        assert_eq!(linear_blur_params(0, 1.0), None);
+        let (s1, sat1) = linear_blur_params(1, 1.0).unwrap();
+        let (s10, _) = linear_blur_params(10, 1.0).unwrap();
+        let (s50, sat50) = linear_blur_params(50, 1.0).unwrap();
+        let (s100, sat100) = linear_blur_params(100, 1.0).unwrap();
+        assert!((s1 - 0.32).abs() < 1e-6);
+        assert!((s10 - 3.20).abs() < 1e-6);
+        assert!((s50 - 16.0).abs() < 1e-6);
+        assert!((s100 - 32.0).abs() < 1e-6);
+        assert!((s50 * 2.0 - s100).abs() < 1e-6);
+        assert!(sat1 < sat50 && sat50 < sat100);
+        assert!(((sat50 - 1.0) * 2.0 - (sat100 - 1.0)).abs() < 1e-6);
+        // Remains strictly linear up to 100% even at 200% HiDPI scaling
+        let (s50_2x, _) = linear_blur_params(50, 2.0).unwrap();
+        let (s100_2x, _) = linear_blur_params(100, 2.0).unwrap();
+        assert!((s50_2x * 2.0 - s100_2x).abs() < 1e-6);
     }
 }

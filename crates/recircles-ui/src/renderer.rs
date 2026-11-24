@@ -12,7 +12,7 @@ pub mod win_render {
     use crate::motion_ring::{LoadingPose3D, RingMotion, RingSector};
     use crate::svg::{PathSeg, SvgDoc, parse_svg};
     use recircles_core::colors::Color;
-    use recircles_core::config::{BUILTIN_CLIPBOARD_SVG, ConfigStore};
+    use recircles_core::config::{BUILTIN_CLIPBOARD_SVG, ConfigStore, linear_blur_params};
     use recircles_core::menu::{BuiltinIcon, Entry, GRID_COLUMNS, GRID_SIZE, LIST_ROWS, Mode, PAGE_SIZE};
     use recircles_core::settings::SliderField;
     use recircles_core::themes::ColorsConfig;
@@ -34,19 +34,12 @@ pub mod win_render {
     struct SurfaceMaterial {
         translucency: f64,
         backdrop_alpha: f64,
+        blur_t: f64,
         high_contrast: bool,
     }
 
     fn blur_params(blur_pct: u8, dpi_scale: f64) -> Option<(f64, f64)> {
-        let pct = blur_pct.min(100);
-        if pct == 0 {
-            return None;
-        }
-        let b = f64::from(pct) / 100.0;
-        // Perceptual curve: subtle veil at low %, creamy Apple frosted glass (~19px) at 60%, deep blur (~38px) at 100%
-        let sigma = (0.35 + b.powf(1.35) * 37.65) * dpi_scale;
-        let sat = 1.0 + 0.24 * b;
-        Some((sigma.clamp(0.25, 64.0), sat))
+        linear_blur_params(blur_pct, dpi_scale)
     }
 
     impl SurfaceMaterial {
@@ -60,14 +53,21 @@ pub mod win_render {
                 return Self {
                     translucency: 0.0,
                     backdrop_alpha: 0.0,
+                    blur_t: 0.0,
                     high_contrast,
                 };
             }
             let translucency = f64::from(translucency_pct.min(100)) / 100.0;
+            let blur_t = if has_backdrop {
+                f64::from(blur_pct.min(100)) / 100.0
+            } else {
+                0.0
+            };
             let backdrop_alpha = if blur_pct > 0 && has_backdrop { 1.0 } else { 0.0 };
             Self {
                 translucency,
                 backdrop_alpha,
+                blur_t,
                 high_contrast: false,
             }
         }
@@ -83,11 +83,12 @@ pub mod win_render {
                 return 1.0;
             }
             let base = (1.0 - self.translucency).clamp(0.0, 1.0);
-            let unblurred_lift = if self.uses_backdrop() {
-                0.0
+            let unblurred_factor = if self.uses_backdrop() {
+                (1.0 - self.blur_t / 0.15).clamp(0.0, 1.0)
             } else {
-                0.20 * base * (1.0 - base)
+                1.0
             };
+            let unblurred_lift = 0.20 * base * (1.0 - base) * unblurred_factor;
             ((base + unblurred_lift) * weight).clamp(0.0, 1.0)
         }
 
@@ -100,11 +101,12 @@ pub mod win_render {
             let ring_a = self.ring_opacity(ring_weight);
             let base = (1.0 - self.translucency).clamp(0.0, 1.0);
             let thicker = base.powf(0.84);
-            let unblurred_lift = if self.uses_backdrop() {
-                0.0
+            let unblurred_factor = if self.uses_backdrop() {
+                (1.0 - self.blur_t / 0.15).clamp(0.0, 1.0)
             } else {
-                0.24 * base * (1.0 - base)
+                1.0
             };
+            let unblurred_lift = 0.24 * base * (1.0 - base) * unblurred_factor;
             let panel_a = ((thicker + unblurred_lift) * panel_weight).clamp(0.0, 1.0);
             lerp(ring_a, panel_a, morph_t.clamp(0.0, 1.0))
         }
@@ -371,9 +373,28 @@ pub mod win_render {
             let pct = blur_pct.min(100);
             self.last_backdrop = Some((screen_x, screen_y, dpi_scale, pct));
             self.last_blur_pct = Some(pct);
-            let sigma = blur_params(pct, dpi_scale).map_or(0.0, |(s, _)| s);
-            self.canvas
-                .capture_backdrop(screen_x, screen_y, self.phys_w, self.phys_h, sigma)
+            let params = blur_params(pct, dpi_scale);
+            let sigma = params.map_or(0.0, |(s, _)| s);
+            let ok = self
+                .canvas
+                .capture_backdrop(screen_x, screen_y, self.phys_w, self.phys_h, sigma);
+            if ok && let Some((s, sat)) = params {
+                let _ = self.canvas.set_backdrop_blur(s, sat);
+            }
+            ok
+        }
+
+        pub fn update_backdrop_dpi(&mut self, dpi_scale: f64, blur_pct: u8) {
+            let pct = blur_pct.min(100);
+            if let Some((sx, sy, _, _)) = self.last_backdrop {
+                self.last_backdrop = Some((sx, sy, dpi_scale, pct));
+            }
+            self.last_blur_pct = Some(pct);
+            if let Some((sigma, sat)) = blur_params(pct, dpi_scale) {
+                let _ = self.canvas.set_backdrop_blur(sigma, sat);
+            } else {
+                let _ = self.canvas.set_backdrop_blur(0.0, 1.0);
+            }
         }
 
         fn sync_backdrop_blur(&mut self, blur_pct: u8) {
@@ -388,6 +409,8 @@ pub mod win_render {
             self.last_blur_pct = Some(pct);
             if let Some((sigma, sat)) = blur_params(pct, dpi_scale) {
                 let _ = self.canvas.set_backdrop_blur(sigma, sat);
+            } else {
+                let _ = self.canvas.set_backdrop_blur(0.0, 1.0);
             }
         }
 
@@ -4632,6 +4655,56 @@ pub mod win_render {
             );
 
             let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn backdrop_blur_scales_linearly_and_recaptures_cleanly() {
+            let hwnd = TestHwnd::new(960, 640);
+            let mut renderer = Renderer::new(hwnd.0, 960, 640, 1.0).expect("d2d renderer");
+            assert!(
+                renderer.capture_backdrop(0, 0, 1.0, 0),
+                "capture_backdrop at 0% should retain raw_backdrop"
+            );
+            assert!(renderer.canvas.has_raw_backdrop(), "raw backdrop must be retained at 0%");
+            assert!(!renderer.canvas.has_backdrop(), "0% blur must have no blurred backdrop");
+
+            // Switching from 0% -> 1% -> 50% -> 100% must activate blur smoothly without recapture
+            let (s1, sat1) = blur_params(1, 1.0).unwrap();
+            assert!(renderer.canvas.set_backdrop_blur(s1, sat1));
+            assert!(renderer.canvas.has_backdrop(), "1% blur must activate blurred backdrop");
+
+            // Render a frame with annulus, rounded rect (with and without hole), and polygon ring
+            renderer.canvas.begin_frame(1.0);
+            renderer.canvas.save();
+            renderer.canvas.translate(480.0, 320.0);
+            renderer.canvas.fill_annulus_backdrop(56.0, 140.0, 1.0);
+            renderer.canvas.restore();
+            renderer.canvas.push_opacity_layer(20.0, 20.0, 300.0, 200.0, 0.65);
+            renderer.canvas.fill_rounded_rect_backdrop(24.0, 24.0, 280.0, 180.0, 18.0, 0.0, 1.0);
+            renderer.canvas.pop_layer();
+            renderer.canvas.fill_rounded_rect_backdrop(360.0, 40.0, 220.0, 140.0, 20.0, 36.0, 0.85);
+            let outer = [(680.0, 80.0), (820.0, 90.0), (810.0, 210.0), (670.0, 200.0)];
+            let inner = [(720.0, 115.0), (775.0, 120.0), (770.0, 175.0), (715.0, 170.0)];
+            renderer.canvas.fill_polygon_ring_backdrop(&outer, &inner, 0.9);
+            assert!(renderer.canvas.end_frame(0), "backdrop frame must present");
+
+            // Returning to 0% disables blur while retaining raw_backdrop for instant re-enable
+            renderer.update_backdrop_dpi(1.5, 65);
+            assert!(renderer.canvas.has_backdrop());
+            renderer.update_backdrop_dpi(1.5, 0);
+            assert!(!renderer.canvas.has_backdrop());
+            assert!(renderer.canvas.has_raw_backdrop());
+
+            // In-place recapture at same dimensions and after resize/recreate
+            assert!(renderer.capture_backdrop(0, 0, 1.0, 25));
+            assert!(renderer.canvas.has_backdrop());
+            renderer.resize(1280, 720, 1.25);
+            assert!(renderer.capture_backdrop(0, 0, 1.25, 40));
+            assert!(renderer.canvas.recreate(), "recreate must succeed on DirectComposition HWND");
+            assert!(renderer.capture_backdrop(0, 0, 1.25, 40));
+            renderer.canvas.begin_frame(1.25);
+            renderer.canvas.fill_rounded_rect_backdrop(40.0, 40.0, 400.0, 260.0, 24.0, 0.0, 1.0);
+            assert!(renderer.canvas.end_frame(0), "post-recreate backdrop frame must present");
         }
     }
 }

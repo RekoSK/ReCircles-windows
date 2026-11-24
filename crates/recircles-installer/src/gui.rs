@@ -14,8 +14,12 @@ pub mod win_gui {
     use crate::vsync::{VsyncPacer, WM_APP_INSTALL_DONE, WM_APP_TICK};
     use recircles_core::config::{
         AppearanceConfig, KeyList, KeybindsConfig, LoadingStyle, OverflowLayout, UpdateMode,
+        linear_blur_params,
     };
-    use recircles_core::ipc::{WM_APP_CAPTURE_KEY, win::to_wide_nul};
+    use recircles_core::ipc::{
+        WM_APP_BACKDROP_DIRTY, WM_APP_CAPTURE_KEY,
+        win::{BackdropWatch, to_wide_nul},
+    };
     use recircles_core::modules::BuiltinSubmenu;
     use recircles_core::settings::NavKeyField;
     use recircles_core::themes::{BuiltinTheme, builtin_theme, builtin_themes};
@@ -35,7 +39,8 @@ pub mod win_gui {
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ValidateRect,
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        MonitorFromWindow, ValidateRect,
     };
     use windows_sys::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -61,10 +66,10 @@ pub mod win_gui {
         SPI_GETCLIENTAREAANIMATION, SW_MINIMIZE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE,
         SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
         SystemParametersInfoW, TranslateMessage, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY,
-        WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
-        WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_POPUP,
-        WS_SYSMENU,
+        WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN,
+        WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX,
+        WS_POPUP, WS_SYSMENU,
     };
 
     const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
@@ -75,8 +80,12 @@ pub mod win_gui {
     const WA_INACTIVE_VAL: usize = 0;
     const TIMER_CARET: usize = 1;
     const TIMER_PULSE: usize = 2;
+    const TIMER_BACKDROP_REFRESH: usize = 3;
+    const TIMER_BACKDROP_SETTLE: usize = 4;
     const CARET_BLINK_MS: u32 = 530;
     const PULSE_INTERVAL_MS: u32 = 33;
+    const BACKDROP_REFRESH_MS: u32 = 45;
+    const BACKDROP_SETTLE_MS: u32 = 320;
 
     mod perf {
         use super::*;
@@ -397,6 +406,8 @@ pub mod win_gui {
         caret_timer_on: bool,
         pulse_timer_on: bool,
         capture_hook: Option<CaptureHook>,
+        backdrop_watch: Option<BackdropWatch>,
+        backdrop_stale: bool,
         last_mouse_phys: (i32, i32),
         backdrop_mon_origin: (i32, i32),
         last_blur_pct: u8,
@@ -802,11 +813,12 @@ pub mod win_gui {
         let mon_w = (mon.right - mon.left).max(1);
         let mon_h = (mon.bottom - mon.top).max(1);
         let init_blur = opts.appearance.blur;
-        let blur_t = f64::from(init_blur) / 100.0;
-        let blur_sigma = ((0.35 + blur_t.powf(1.35) * 37.65) * scale).clamp(0.25, 64.0);
-        let blur_sat = 1.0 + 0.24 * blur_t;
-        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, blur_sigma) {
-            let _ = canvas.set_backdrop_blur(blur_sigma, blur_sat);
+        let init_params = linear_blur_params(init_blur, scale);
+        let init_sigma = init_params.map_or(0.0, |(s, _)| s);
+        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, init_sigma) {
+            if let Some((s, sat)) = init_params {
+                let _ = canvas.set_backdrop_blur(s, sat);
+            }
             canvas.set_backdrop_origin((cx - mon.left) as f64, (cy - mon.top) as f64);
         }
 
@@ -850,6 +862,8 @@ pub mod win_gui {
             caret_timer_on: false,
             pulse_timer_on: false,
             capture_hook: None,
+            backdrop_watch: Some(BackdropWatch::install(hwnd)),
+            backdrop_stale: false,
             last_mouse_phys: (-1, -1),
             backdrop_mon_origin: (mon.left, mon.top),
             last_blur_pct: init_blur,
@@ -1063,6 +1077,75 @@ pub mod win_gui {
         });
     }
 
+    fn capture_monitor_backdrop_for_hwnd(
+        hwnd: HWND,
+        canvas: &mut D2dCanvas,
+        blur_pct: u8,
+        scale: f64,
+    ) -> Option<(i32, i32)> {
+        let mut wr: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(hwnd, &mut wr) } == 0 {
+            return None;
+        }
+        let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        if unsafe { GetMonitorInfoW(hmon, &mut mi) } == 0 {
+            return None;
+        }
+        let mon = mi.rcMonitor;
+        let mon_w = (mon.right - mon.left).max(1);
+        let mon_h = (mon.bottom - mon.top).max(1);
+        let params = linear_blur_params(blur_pct, scale);
+        let sigma = params.map_or(0.0, |(s, _)| s);
+        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, sigma) {
+            if let Some((s, sat)) = params {
+                let _ = canvas.set_backdrop_blur(s, sat);
+            }
+            canvas.set_backdrop_origin((wr.left - mon.left) as f64, (wr.top - mon.top) as f64);
+            Some((mon.left, mon.top))
+        } else {
+            None
+        }
+    }
+
+    fn refresh_wizard_backdrop(st: &mut WizardState) {
+        if st.closing || st.minimized || unsafe { IsIconic(st.hwnd) } != 0 {
+            st.backdrop_stale = true;
+            return;
+        }
+        if st.opts.appearance.high_contrast
+            || st.opts.appearance.translucency == 0
+            || st.opts.appearance.blur == 0
+        {
+            st.backdrop_stale = true;
+            return;
+        }
+        if st.drag_win.is_some() {
+            st.backdrop_stale = true;
+            return;
+        }
+        if let Some(origin) = capture_monitor_backdrop_for_hwnd(
+            st.hwnd,
+            &mut st.canvas,
+            st.opts.appearance.blur,
+            st.scale,
+        ) {
+            st.backdrop_mon_origin = origin;
+            st.last_blur_pct = st.opts.appearance.blur;
+            st.backdrop_stale = false;
+        }
+    }
+
+    fn schedule_backdrop_refresh(hwnd: HWND, delay_ms: u32) {
+        unsafe {
+            KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+            SetTimer(hwnd, TIMER_BACKDROP_REFRESH, delay_ms, None);
+        }
+    }
+
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
@@ -1083,9 +1166,11 @@ pub mod win_gui {
                 let pw = (lparam & 0xFFFF) as i16 as i32;
                 let ph = ((lparam >> 16) & 0xFFFF) as i16 as i32;
                 let mut eff = DispatchEffects::default();
+                let mut restored_from_min = false;
                 with_wiz(|st| {
                     if kind == SIZE_MINIMIZED_VAL {
                         st.minimized = true;
+                        st.backdrop_stale = true;
                         st.last_animating = false;
                         clear_pointer_state(st);
                         if st.has_capture {
@@ -1104,16 +1189,21 @@ pub mod win_gui {
                         }
                         sync_timers_effects(st, &mut eff);
                         if was_min {
+                            restored_from_min = true;
                             wake_and_paint(st);
                         }
                     }
                 });
                 run_dispatch_effects(hwnd, eff);
+                if restored_from_min {
+                    schedule_backdrop_refresh(hwnd, 35);
+                }
                 0
             }
             WM_ACTIVATE => {
                 let state = wparam & 0xFFFF;
                 let mut eff = DispatchEffects::default();
+                let mut should_refresh = false;
                 if state == WA_INACTIVE_VAL {
                     with_wiz(|st| {
                         st.focused = false;
@@ -1123,8 +1213,11 @@ pub mod win_gui {
                             eff.release_capture = true;
                         }
                         sync_timers_effects(st, &mut eff);
-                        if changed && !st.minimized && unsafe { IsIconic(hwnd) } == 0 {
-                            schedule_paint(st);
+                        if !st.minimized && unsafe { IsIconic(hwnd) } == 0 {
+                            should_refresh = true;
+                            if changed {
+                                schedule_paint(st);
+                            }
                         }
                     });
                 } else {
@@ -1132,20 +1225,74 @@ pub mod win_gui {
                         st.focused = true;
                         st.last_tick = Instant::now();
                         sync_timers_effects(st, &mut eff);
-                        if (st.editing_dir || st.capturing_hotkey.is_some())
-                            && !st.minimized
-                            && unsafe { IsIconic(hwnd) } == 0
-                        {
-                            st.caret_visible = true;
-                            render_frame(st);
+                        if !st.minimized && unsafe { IsIconic(hwnd) } == 0 {
+                            should_refresh = true;
+                            if st.editing_dir || st.capturing_hotkey.is_some() {
+                                st.caret_visible = true;
+                                render_frame(st);
+                            }
                         }
                     });
                 }
                 run_dispatch_effects(hwnd, eff);
+                if should_refresh {
+                    let delay = if state == WA_INACTIVE_VAL {
+                        BACKDROP_REFRESH_MS
+                    } else {
+                        30
+                    };
+                    schedule_backdrop_refresh(hwnd, delay);
+                }
+                0
+            }
+            WM_APP_BACKDROP_DIRTY => {
+                let mut should_refresh = false;
+                with_wiz(|st| {
+                    if let Some(watch) = &st.backdrop_watch {
+                        watch.ack();
+                    }
+                    if st.minimized || unsafe { IsIconic(hwnd) } != 0 {
+                        st.backdrop_stale = true;
+                    } else if st.drag_win.is_some() {
+                        st.backdrop_stale = true;
+                    } else {
+                        should_refresh = true;
+                    }
+                });
+                if should_refresh {
+                    schedule_backdrop_refresh(hwnd, BACKDROP_REFRESH_MS);
+                }
+                0
+            }
+            WM_DISPLAYCHANGE => {
+                schedule_backdrop_refresh(hwnd, 60);
                 0
             }
             WM_TIMER => {
                 let timer_id = wparam;
+                if timer_id == TIMER_BACKDROP_REFRESH || timer_id == TIMER_BACKDROP_SETTLE {
+                    unsafe { KillTimer(hwnd, timer_id) };
+                    let mut arm_settle = false;
+                    with_wiz(|st| {
+                        if st.minimized || unsafe { IsIconic(hwnd) } != 0 {
+                            st.backdrop_stale = true;
+                            return;
+                        }
+                        if st.drag_win.is_some() {
+                            st.backdrop_stale = true;
+                            return;
+                        }
+                        refresh_wizard_backdrop(st);
+                        render_frame(st);
+                        if timer_id == TIMER_BACKDROP_REFRESH {
+                            arm_settle = true;
+                        }
+                    });
+                    if arm_settle {
+                        unsafe { SetTimer(hwnd, TIMER_BACKDROP_SETTLE, BACKDROP_SETTLE_MS, None) };
+                    }
+                    return 0;
+                }
                 with_wiz(|st| {
                     if st.minimized || unsafe { IsIconic(hwnd) } != 0 {
                         return;
@@ -1264,6 +1411,7 @@ pub mod win_gui {
                     }
                     with_wiz(|st| {
                         st.canvas.resize(phys_w, phys_h, new_scale);
+                        refresh_wizard_backdrop(st);
                         wake_and_paint(st);
                     });
                 }
@@ -1300,6 +1448,41 @@ pub mod win_gui {
                         unsafe { GetCursorPos(&mut pt) };
                         let nx = drag.win_start_x + (pt.x - drag.start_screen_x);
                         let ny = drag.win_start_y + (pt.y - drag.start_screen_y);
+                        let phys_w = (WIN_W * st.scale).round() as i32;
+                        let phys_h = (WIN_H * st.scale).round() as i32;
+                        let center_pt = POINT {
+                            x: nx + phys_w / 2,
+                            y: ny + phys_h / 2,
+                        };
+                        let hmon = unsafe { MonitorFromPoint(center_pt, MONITOR_DEFAULTTONEAREST) };
+                        let mut mi = MONITORINFO {
+                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                            ..unsafe { std::mem::zeroed() }
+                        };
+                        if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
+                            let mon = mi.rcMonitor;
+                            if (mon.left, mon.top) != st.backdrop_mon_origin
+                                && !st.opts.appearance.high_contrast
+                                && st.opts.appearance.translucency > 0
+                                && st.opts.appearance.blur > 0
+                            {
+                                let mon_w = (mon.right - mon.left).max(1);
+                                let mon_h = (mon.bottom - mon.top).max(1);
+                                let params = linear_blur_params(st.opts.appearance.blur, st.scale);
+                                let sigma = params.map_or(0.0, |(s, _)| s);
+                                if st
+                                    .canvas
+                                    .capture_backdrop(mon.left, mon.top, mon_w, mon_h, sigma)
+                                {
+                                    if let Some((s, sat)) = params {
+                                        let _ = st.canvas.set_backdrop_blur(s, sat);
+                                    }
+                                    st.backdrop_mon_origin = (mon.left, mon.top);
+                                    st.last_blur_pct = st.opts.appearance.blur;
+                                    st.backdrop_stale = false;
+                                }
+                            }
+                        }
                         st.canvas.set_backdrop_origin(
                             (nx - st.backdrop_mon_origin.0) as f64,
                             (ny - st.backdrop_mon_origin.1) as f64,
@@ -1496,6 +1679,7 @@ pub mod win_gui {
                 let py = ((lparam >> 16) & 0xFFFF) as i16 as f64;
                 let mut commit_action = None;
                 let mut commit_ring_sub = None;
+                let mut need_backdrop_refresh = false;
                 let mut eff = DispatchEffects::default();
 
                 with_wiz(|st| {
@@ -1519,6 +1703,9 @@ pub mod win_gui {
                         if st.has_capture {
                             st.has_capture = false;
                             eff.release_capture = true;
+                        }
+                        if st.backdrop_stale {
+                            need_backdrop_refresh = true;
                         }
                         return;
                     }
@@ -1563,6 +1750,9 @@ pub mod win_gui {
                 });
 
                 run_dispatch_effects(hwnd, eff);
+                if need_backdrop_refresh {
+                    schedule_backdrop_refresh(hwnd, 20);
+                }
 
                 if let Some(sub) = commit_ring_sub {
                     with_wiz(|st| {
@@ -1715,6 +1905,10 @@ pub mod win_gui {
                 0
             }
             WM_DESTROY => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_BACKDROP_REFRESH);
+                    KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+                }
                 WIZ.with(|slot| {
                     if let Ok(mut guard) = slot.try_borrow_mut()
                         && let Some(st) = guard.as_mut()
@@ -1729,6 +1923,7 @@ pub mod win_gui {
                             unsafe { KillTimer(hwnd, TIMER_PULSE) };
                         }
                         sync_capture_hook_state(st, true);
+                        st.backdrop_watch = None;
                         st.pacer.stop();
                     }
                 });
@@ -2221,21 +2416,23 @@ pub mod win_gui {
         let master_a = st.ring.open_alpha.value.clamp(0.0, 1.0);
         let open_s = st.ring.open_scale.value.clamp(0.84, 1.04);
 
-        // Live GPU backdrop blur sync when Blur slider changes
-        if st.canvas.has_backdrop()
-            && !st.opts.appearance.high_contrast
+        // Live GPU backdrop refresh & linear blur sync when Appearance settings change
+        let want_backdrop = !st.opts.appearance.high_contrast
             && st.opts.appearance.translucency > 0
-            && st.opts.appearance.blur != st.last_blur_pct
-        {
+            && st.opts.appearance.blur > 0;
+        if st.backdrop_stale && want_backdrop && st.drag_win.is_none() {
+            refresh_wizard_backdrop(st);
+        } else if st.opts.appearance.blur != st.last_blur_pct {
             st.last_blur_pct = st.opts.appearance.blur;
-            let blur_t = f64::from(st.last_blur_pct) / 100.0;
-            let blur_sigma = if st.last_blur_pct == 0 {
-                0.0
+            if let Some((blur_sigma, blur_sat)) = linear_blur_params(st.last_blur_pct, st.scale) {
+                if !st.canvas.has_raw_backdrop() && want_backdrop && st.drag_win.is_none() {
+                    refresh_wizard_backdrop(st);
+                } else {
+                    let _ = st.canvas.set_backdrop_blur(blur_sigma, blur_sat);
+                }
             } else {
-                ((0.35 + blur_t.powf(1.35) * 37.65) * st.scale).clamp(0.25, 64.0)
-            };
-            let blur_sat = 1.0 + 0.24 * blur_t;
-            let _ = st.canvas.set_backdrop_blur(blur_sigma, blur_sat);
+                let _ = st.canvas.set_backdrop_blur(0.0, 1.0);
+            }
         }
 
         st.hits.clear();
@@ -2291,6 +2488,7 @@ pub mod win_gui {
             && st.canvas.recreate()
         {
             st.recreating = true;
+            refresh_wizard_backdrop(st);
             draw_scene(st);
             let _ = st.canvas.end_frame(0);
             st.recreating = false;
@@ -6537,8 +6735,10 @@ pub mod win_gui {
     }
 
     struct UpdaterOverlayState {
+        hwnd: HWND,
         canvas: D2dCanvas,
         pacer: VsyncPacer,
+        backdrop_watch: Option<BackdropWatch>,
         scale: f64,
         palette: ThemePalette,
         blur_pct: u8,
@@ -6726,11 +6926,12 @@ pub mod win_gui {
 
         let mon_w = (mon.right - mon.left).max(1);
         let mon_h = (mon.bottom - mon.top).max(1);
-        let blur_t = f64::from(blur_pct) / 100.0;
-        let blur_sigma = ((0.35 + blur_t.powf(1.35) * 37.65) * scale).clamp(0.25, 64.0);
-        let blur_sat = 1.0 + 0.24 * blur_t;
-        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, blur_sigma) {
-            let _ = canvas.set_backdrop_blur(blur_sigma, blur_sat);
+        let init_params = linear_blur_params(blur_pct, scale);
+        let init_sigma = init_params.map_or(0.0, |(s, _)| s);
+        if canvas.capture_backdrop(mon.left, mon.top, mon_w, mon_h, init_sigma) {
+            if let Some((s, sat)) = init_params {
+                let _ = canvas.set_backdrop_blur(s, sat);
+            }
             canvas.set_backdrop_origin((cx - mon.left) as f64, (cy - mon.top) as f64);
         }
 
@@ -6739,8 +6940,10 @@ pub mod win_gui {
         pacer.set_animating(true);
 
         let mut st = UpdaterOverlayState {
+            hwnd,
             canvas,
             pacer,
+            backdrop_watch: Some(BackdropWatch::install(hwnd)),
             scale,
             palette,
             blur_pct,
@@ -7185,7 +7388,16 @@ pub mod win_gui {
             );
         }
 
-        let _ = st.canvas.end_frame(0);
+        if !st.canvas.end_frame(0) && st.canvas.recreate() {
+            if !st.high_contrast && st.translucency_pct > 0 && st.blur_pct > 0 {
+                let _ = capture_monitor_backdrop_for_hwnd(
+                    st.hwnd,
+                    &mut st.canvas,
+                    st.blur_pct,
+                    st.scale,
+                );
+            }
+        }
     }
 
     unsafe extern "system" fn updater_wnd_proc(
@@ -7196,6 +7408,60 @@ pub mod win_gui {
     ) -> LRESULT {
         match msg {
             WM_ERASEBKGND => 1,
+            WM_APP_BACKDROP_DIRTY => {
+                let mut should_refresh = false;
+                UPD_STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        if let Some(watch) = &st.backdrop_watch {
+                            watch.ack();
+                        }
+                        if !st.closing
+                            && !st.high_contrast
+                            && st.translucency_pct > 0
+                            && st.blur_pct > 0
+                        {
+                            should_refresh = true;
+                        }
+                    }
+                });
+                if should_refresh {
+                    schedule_backdrop_refresh(hwnd, BACKDROP_REFRESH_MS);
+                }
+                0
+            }
+            WM_DISPLAYCHANGE => {
+                schedule_backdrop_refresh(hwnd, 60);
+                0
+            }
+            WM_TIMER => {
+                let timer_id = wparam;
+                if timer_id == TIMER_BACKDROP_REFRESH || timer_id == TIMER_BACKDROP_SETTLE {
+                    unsafe { KillTimer(hwnd, timer_id) };
+                    let mut arm_settle = false;
+                    UPD_STATE.with(|slot| {
+                        if let Some(st) = slot.borrow_mut().as_mut()
+                            && !st.closing
+                            && !st.high_contrast
+                            && st.translucency_pct > 0
+                            && st.blur_pct > 0
+                        {
+                            let _ = capture_monitor_backdrop_for_hwnd(
+                                st.hwnd,
+                                &mut st.canvas,
+                                st.blur_pct,
+                                st.scale,
+                            );
+                            if timer_id == TIMER_BACKDROP_REFRESH {
+                                arm_settle = true;
+                            }
+                        }
+                    });
+                    if arm_settle {
+                        unsafe { SetTimer(hwnd, TIMER_BACKDROP_SETTLE, BACKDROP_SETTLE_MS, None) };
+                    }
+                }
+                0
+            }
             WM_APP_TICK => {
                 let mut should_destroy = false;
                 UPD_STATE.with(|slot| {
@@ -7264,8 +7530,13 @@ pub mod win_gui {
                 0
             }
             WM_DESTROY => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_BACKDROP_REFRESH);
+                    KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+                }
                 UPD_STATE.with(|slot| {
                     if let Some(st) = slot.borrow_mut().as_mut() {
+                        st.backdrop_watch = None;
                         st.pacer.set_animating(false);
                     }
                 });
@@ -7530,6 +7801,8 @@ pub mod win_gui {
                 caret_timer_on: false,
                 pulse_timer_on: false,
                 capture_hook: None,
+                backdrop_watch: None,
+                backdrop_stale: false,
                 last_mouse_phys: (-1, -1),
                 backdrop_mon_origin: (0, 0),
                 last_blur_pct: opts.appearance.blur,

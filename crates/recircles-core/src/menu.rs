@@ -613,13 +613,16 @@ impl MenuState {
             selected: self.selected.unwrap_or(0),
         });
         self.query = comp.clone();
-        self.selected = Some(filtered_idx);
-        self.page = filtered_idx / PAGE_SIZE;
-        self.ensure_grid_selection_visible();
-        if filtered_idx < self.list_scroll {
-            self.list_scroll = filtered_idx;
-        } else if filtered_idx >= self.list_scroll + LIST_ROWS {
-            self.list_scroll = (filtered_idx + 1 - LIST_ROWS).min(self.list_max_scroll());
+        self.refilter(true);
+        if let Some(new_fi) = self.filtered.iter().position(|&idx| idx == item_idx) {
+            self.selected = Some(new_fi);
+            self.page = new_fi / PAGE_SIZE;
+            self.ensure_grid_selection_visible();
+            if new_fi < self.list_scroll {
+                self.list_scroll = new_fi;
+            } else if new_fi >= self.list_scroll + LIST_ROWS {
+                self.list_scroll = (new_fi + 1 - LIST_ROWS).min(self.list_max_scroll());
+            }
         }
         Some(comp)
     }
@@ -868,5 +871,34 @@ mod tests {
         s111.turn_grid_page(-1);
         assert_eq!(s111.grid_first_visible(), 100);
         assert_eq!(s111.grid_visible_slice().len(), 11); // items 100..111
+    }
+
+    #[test]
+    fn accept_completion_refilters_results_and_undo_restores_them() {
+        let mut state = MenuState::default();
+        let items = vec![
+            Entry::simple("undertale", "Undertale", BuiltinIcon::App),
+            Entry::simple("utorrent", "uTorrent", BuiltinIcon::App),
+            Entry::simple("ubuntu", "Ubuntu", BuiltinIcon::App),
+        ];
+        state.set_items(items, false);
+
+        state.push_char('u');
+        assert_eq!(state.filtered.len(), 3);
+        let (fi, suffix) = state.suggestion(false).expect("expected suggestion");
+        assert_eq!(suffix, "ndertale");
+
+        let completed = state.accept_completion(fi).expect("expected completion");
+        assert_eq!(completed, "Undertale");
+        assert_eq!(state.query, "Undertale");
+        assert_eq!(state.filtered.len(), 1);
+        assert_eq!(
+            state.selected_entry().map(|e| e.title.as_str()),
+            Some("Undertale")
+        );
+
+        let restored = state.undo_completion().expect("expected undo");
+        assert_eq!(restored, "u");
+        assert_eq!(state.filtered.len(), 3);
     }
 }

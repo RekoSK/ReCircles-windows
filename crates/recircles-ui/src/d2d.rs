@@ -168,6 +168,7 @@ unsafe extern "C" {
     ) -> i32;
     fn d2d_set_backdrop_blur(ctx: *mut c_void, blur_sigma_px: f32, saturation: f32) -> i32;
     fn d2d_has_backdrop(ctx: *mut c_void) -> i32;
+    fn d2d_has_raw_backdrop(ctx: *mut c_void) -> i32;
     fn d2d_resize(ctx: *mut c_void, phys_w: i32, phys_h: i32, logical_scale: f32);
     fn d2d_begin_frame(ctx: *mut c_void, logical_scale: f32);
     fn d2d_end_frame(ctx: *mut c_void, sync_interval: i32) -> i32;
@@ -652,6 +653,10 @@ impl D2dCanvas {
 
     pub fn has_backdrop(&self) -> bool {
         unsafe { d2d_has_backdrop(self.ptr) != 0 }
+    }
+
+    pub fn has_raw_backdrop(&self) -> bool {
+        unsafe { d2d_has_raw_backdrop(self.ptr) != 0 }
     }
 
     pub fn resize(&mut self, phys_w: i32, phys_h: i32, logical_scale: f64) {

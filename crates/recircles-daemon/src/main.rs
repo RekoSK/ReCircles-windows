@@ -41,14 +41,15 @@ mod win_daemon {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::DataExchange::{
         AddClipboardFormatListener, RemoveClipboardFormatListener,
     };
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleW, GetProcAddress, LoadLibraryW,
+    };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
     use windows_sys::Win32::UI::Shell::{
         NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -58,14 +59,31 @@ mod win_daemon {
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
         DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, KillTimer, MF_CHECKED,
         MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-        RegisterClassExW, SetForegroundWindow, SetTimer, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLIPBOARDUPDATE,
-        WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+        RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, TPM_BOTTOMALIGN,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+        WM_CLIPBOARDUPDATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+        WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     const TRAY_UID: u32 = 1;
     const TIMER_UPDATE_CHECK: usize = 1;
     const TIMER_IDLE_APPLY: usize = 2;
+
+    const WM_POWERBROADCAST: u32 = 0x0218;
+    const PBT_APMSUSPEND: usize = 0x0004;
+    const PBT_APMRESUMESUSPEND: usize = 0x0007;
+    const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+    const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+    const WTS_CONSOLE_CONNECT: usize = 0x1;
+    const WTS_CONSOLE_DISCONNECT: usize = 0x2;
+    const WTS_REMOTE_CONNECT: usize = 0x3;
+    const WTS_REMOTE_DISCONNECT: usize = 0x4;
+    const WTS_SESSION_LOCK: usize = 0x7;
+    const WTS_SESSION_UNLOCK: usize = 0x8;
+
+    static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
     const CMD_OPEN_MAIN: u32 = 1001;
     const CMD_RELOAD: u32 = 1002;
@@ -90,16 +108,178 @@ mod win_daemon {
         },
     }
 
+    enum DaemonTask {
+        LaunchUi {
+            close_existing: bool,
+            target: Option<String>,
+        },
+        CaptureClipboard {
+            host: Arc<SubmenuHost>,
+            data_dir: String,
+        },
+    }
+
+    struct DaemonWorker {
+        tx: Option<mpsc::Sender<DaemonTask>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DaemonWorker {
+        fn spawn() -> Self {
+            let (tx, rx) = mpsc::channel::<DaemonTask>();
+            let join = std::thread::Builder::new()
+                .name("recircles-daemon-worker".into())
+                .spawn(move || {
+                    while let Ok(task) = rx.recv() {
+                        match task {
+                            DaemonTask::LaunchUi {
+                                close_existing,
+                                target,
+                            } => {
+                                if close_existing {
+                                    let _ = close_existing_ui_instances();
+                                }
+                                let exe_dir = paths::exe_dir();
+                                let _ = launch_ui_detached(&exe_dir, target.as_deref());
+                            }
+                            DaemonTask::CaptureClipboard { host, data_dir } => {
+                                let _ = host.invoke(
+                                    BuiltinSubmenu::Clipboard,
+                                    &SubmenuRequest::ClipboardCaptureNow {
+                                        data_dir,
+                                        max_items: 120,
+                                        ignore_internal_marker: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                })
+                .ok();
+            Self { tx: Some(tx), join }
+        }
+
+        fn enqueue_launch(&self, close_existing: bool, target: Option<String>) {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(DaemonTask::LaunchUi {
+                    close_existing,
+                    target,
+                });
+            } else {
+                if close_existing {
+                    let _ = close_existing_ui_instances();
+                }
+                let _ = launch_ui_detached(&paths::exe_dir(), target.as_deref());
+            }
+        }
+
+        fn enqueue_clipboard(&self, host: Arc<SubmenuHost>, data_dir: String) {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(DaemonTask::CaptureClipboard { host, data_dir });
+            }
+        }
+    }
+
+    impl Drop for DaemonWorker {
+        fn drop(&mut self) {
+            self.tx.take();
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    type FnWtsRegisterSessionNotification = unsafe extern "system" fn(HWND, u32) -> i32;
+    type FnWtsUnRegisterSessionNotification = unsafe extern "system" fn(HWND) -> i32;
+
+    struct WtsSessionGuard {
+        module: HMODULE,
+        hwnd: HWND,
+        unregister: Option<FnWtsUnRegisterSessionNotification>,
+        registered: bool,
+    }
+
+    impl WtsSessionGuard {
+        fn register(hwnd: HWND) -> Self {
+            let dll = to_wide_nul("wtsapi32.dll");
+            let module = unsafe { LoadLibraryW(dll.as_ptr()) };
+            if module.is_null() {
+                return Self {
+                    module,
+                    hwnd,
+                    unregister: None,
+                    registered: false,
+                };
+            }
+            let reg_sym = unsafe {
+                GetProcAddress(module, c"WTSRegisterSessionNotification".as_ptr().cast())
+            };
+            let unreg_sym = unsafe {
+                GetProcAddress(module, c"WTSUnRegisterSessionNotification".as_ptr().cast())
+            };
+            let (Some(reg_ptr), Some(unreg_ptr)) = (reg_sym, unreg_sym) else {
+                unsafe { FreeLibrary(module) };
+                return Self {
+                    module: std::ptr::null_mut(),
+                    hwnd,
+                    unregister: None,
+                    registered: false,
+                };
+            };
+            let reg_fn: FnWtsRegisterSessionNotification = unsafe { std::mem::transmute(reg_ptr) };
+            let unreg_fn: FnWtsUnRegisterSessionNotification =
+                unsafe { std::mem::transmute(unreg_ptr) };
+            let ok = unsafe { reg_fn(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
+            if !ok {
+                unsafe { FreeLibrary(module) };
+                return Self {
+                    module: std::ptr::null_mut(),
+                    hwnd,
+                    unregister: None,
+                    registered: false,
+                };
+            }
+            Self {
+                module,
+                hwnd,
+                unregister: Some(unreg_fn),
+                registered: true,
+            }
+        }
+    }
+
+    impl Drop for WtsSessionGuard {
+        fn drop(&mut self) {
+            if self.registered
+                && let Some(unreg) = self.unregister
+            {
+                unsafe {
+                    let _ = unreg(self.hwnd);
+                }
+                self.registered = false;
+            }
+            if !self.module.is_null() {
+                unsafe {
+                    FreeLibrary(self.module);
+                }
+                self.module = std::ptr::null_mut();
+            }
+        }
+    }
+
     struct DaemonState {
         hwnd: HWND,
         store: ConfigStore,
         cfg: AppConfig,
-        host: SubmenuHost,
+        host: Arc<SubmenuHost>,
+        worker: DaemonWorker,
+        _wts_guard: WtsSessionGuard,
         hotkeys: HashMap<i32, Option<String>>,
         registered_os_ids: Vec<i32>,
         hook_guard: Option<GlobalHotkeyHook>,
         failed_hotkeys: Vec<String>,
         clipboard_listening: bool,
+        tray_added: bool,
         tray_icon: HICON,
         update_busy: bool,
         available_update: Option<ReleaseInfo>,
@@ -161,6 +341,11 @@ mod win_daemon {
             std::process::exit(1);
         }
 
+        let tb_name = to_wide_nul("TaskbarCreated");
+        let tb_msg = unsafe { RegisterWindowMessageW(tb_name.as_ptr()) };
+        TASKBAR_CREATED_MSG.store(tb_msg, Ordering::Relaxed);
+
+        let wts_guard = WtsSessionGuard::register(hwnd);
         let store = ConfigStore::default_store();
         updater::cleanup_old_installers(store.dir());
         let cached_avail = UpdateState::load(store.dir())
@@ -176,12 +361,15 @@ mod win_daemon {
             hwnd,
             store,
             cfg,
-            host: SubmenuHost::new(installed),
+            host: Arc::new(SubmenuHost::new(installed)),
+            worker: DaemonWorker::spawn(),
+            _wts_guard: wts_guard,
             hotkeys: HashMap::new(),
             registered_os_ids: Vec::new(),
             hook_guard: None,
             failed_hotkeys: Vec::new(),
             clipboard_listening: false,
+            tray_added: false,
             tray_icon,
             update_busy: false,
             available_update: cached_avail,
@@ -189,13 +377,15 @@ mod win_daemon {
             pending_auto_install: None,
             update_inbox: Arc::new(Mutex::new(Vec::new())),
         };
-        add_tray_icon(&st);
+        // Install global hotkeys / WH_KEYBOARD_LL BEFORE Shell_NotifyIconW so Win+E works
+        // immediately at logon even while explorer.exe is still bringing up the taskbar.
         apply_runtime_config(&mut st);
+        add_tray_icon(&mut st);
+        update_tray_tooltip(&st);
         // Check for updates immediately on tray/daemon startup when Auto-install or Notify is enabled
         if st.cfg.updates.mode != UpdateMode::Manual {
             start_update_check(&mut st, false);
         }
-        trim_working_set();
 
         STATE.with(|slot| *slot.borrow_mut() = Some(st));
 
@@ -231,10 +421,15 @@ mod win_daemon {
     }
 
     fn apply_runtime_config(st: &mut DaemonState) {
-        unregister_all_hotkeys(st);
+        unregister_os_hotkeys(st);
         st.failed_hotkeys.clear();
-        st.host.refresh_installed();
-        let installed = st.host.installed().clone();
+        let installed = InstalledModules::detect_default();
+        let modules_changed = BuiltinSubmenu::ALL
+            .iter()
+            .any(|&sub| installed.is_installed(sub) != st.host.installed().is_installed(sub));
+        if modules_changed {
+            st.host = Arc::new(SubmenuHost::new(installed.clone()));
+        }
         st.cfg = st
             .store
             .load_or_create(&installed)
@@ -288,35 +483,43 @@ mod win_daemon {
 
         if !hook_pending.is_empty() {
             let entries: Vec<HookBindingEntry> = hook_pending.iter().map(|(_, e)| *e).collect();
-            match GlobalHotkeyHook::install(st.hwnd, WM_APP_HOOK_HOTKEY, entries) {
-                Ok(guard) => {
-                    st.hook_guard = Some(guard);
-                    for (binding, _) in hook_pending {
-                        st.hotkeys.insert(binding.id, binding.target_menu);
-                    }
+            if let Some(hook) = &st.hook_guard {
+                // Update active bindings in-place on the dedicated hook thread (zero unhook gap).
+                hook.update_bindings(entries);
+                for (binding, _) in hook_pending {
+                    st.hotkeys.insert(binding.id, binding.target_menu);
                 }
-                Err(e) => {
-                    eprintln!("ReCircles Daemon: low-level keyboard hook failed: {e}");
-                    for (binding, _) in hook_pending {
-                        st.failed_hotkeys.push(binding.label);
+            } else {
+                match GlobalHotkeyHook::install(st.hwnd, WM_APP_HOOK_HOTKEY, entries) {
+                    Ok(guard) => {
+                        st.hook_guard = Some(guard);
+                        for (binding, _) in hook_pending {
+                            st.hotkeys.insert(binding.id, binding.target_menu);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ReCircles Daemon: low-level keyboard hook failed: {e}");
+                        for (binding, _) in hook_pending {
+                            st.failed_hotkeys.push(binding.label);
+                        }
                     }
                 }
             }
+        } else {
+            st.hook_guard = None;
         }
-        update_tray_tooltip(st);
+        if st.tray_added {
+            update_tray_tooltip(st);
+        }
 
         let want_clipboard = installed.is_installed(BuiltinSubmenu::Clipboard);
         if want_clipboard && !st.clipboard_listening {
             if unsafe { AddClipboardFormatListener(st.hwnd) } != 0 {
                 st.clipboard_listening = true;
-                // Seed initial clipboard item cleanly on attach if none
-                let _ = st.host.invoke(
-                    BuiltinSubmenu::Clipboard,
-                    &SubmenuRequest::ClipboardCaptureNow {
-                        data_dir: st.store.dir().to_string_lossy().into_owned(),
-                        max_items: 120,
-                        ignore_internal_marker: true,
-                    },
+                // Seed initial clipboard item cleanly off the daemon UI thread
+                st.worker.enqueue_clipboard(
+                    Arc::clone(&st.host),
+                    st.store.dir().to_string_lossy().into_owned(),
                 );
             }
         } else if !want_clipboard && st.clipboard_listening {
@@ -511,8 +714,7 @@ mod win_daemon {
         }
     }
 
-    fn unregister_all_hotkeys(st: &mut DaemonState) {
-        st.hook_guard = None;
+    fn unregister_os_hotkeys(st: &mut DaemonState) {
         for id in st.registered_os_ids.drain(..) {
             unsafe {
                 UnregisterHotKey(st.hwnd, id);
@@ -521,10 +723,9 @@ mod win_daemon {
         st.hotkeys.clear();
     }
 
-    fn trim_working_set() {
-        unsafe {
-            SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
-        }
+    fn unregister_all_hotkeys(st: &mut DaemonState) {
+        st.hook_guard = None;
+        unregister_os_hotkeys(st);
     }
 
     fn handle_hotkey(st: &DaemonState, id: i32) {
@@ -539,24 +740,16 @@ mod win_daemon {
             }
             return;
         }
-        if !ui.is_null() {
-            let _ = close_existing_ui_instances();
-        }
-        let exe_dir = paths::exe_dir();
-        let _ = launch_ui_detached(&exe_dir, target.as_deref());
+        st.worker.enqueue_launch(!ui.is_null(), target.clone());
     }
 
     fn handle_clipboard_update(st: &DaemonState) {
         if !st.clipboard_listening {
             return;
         }
-        let _ = st.host.invoke(
-            BuiltinSubmenu::Clipboard,
-            &SubmenuRequest::ClipboardCaptureNow {
-                data_dir: st.store.dir().to_string_lossy().into_owned(),
-                max_items: 120,
-                ignore_internal_marker: true,
-            },
+        st.worker.enqueue_clipboard(
+            Arc::clone(&st.host),
+            st.store.dir().to_string_lossy().into_owned(),
         );
     }
 
@@ -774,7 +967,11 @@ mod win_daemon {
         match chosen {
             0 => {}
             CMD_OPEN_MAIN => {
-                let _ = launch_ui_detached(&paths::exe_dir(), None);
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow().as_ref() {
+                        st.worker.enqueue_launch(false, None);
+                    }
+                });
             }
             CMD_UPDATE_CHECK => {
                 STATE.with(|slot| {
@@ -832,13 +1029,17 @@ mod win_daemon {
             }
             other => {
                 if let Some((_, id)) = idx_map.into_iter().find(|(c, _)| *c == other) {
-                    let _ = launch_ui_detached(&paths::exe_dir(), Some(&id));
+                    STATE.with(|slot| {
+                        if let Some(st) = slot.borrow().as_ref() {
+                            st.worker.enqueue_launch(false, Some(id));
+                        }
+                    });
                 }
             }
         }
     }
 
-    fn add_tray_icon(st: &DaemonState) {
+    fn add_tray_icon(st: &mut DaemonState) {
         let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = st.hwnd;
@@ -849,9 +1050,8 @@ mod win_daemon {
         let tip = to_wide_nul("ReCircles Daemon");
         let n = tip.len().min(nid.szTip.len());
         nid.szTip[..n].copy_from_slice(&tip[..n]);
-        unsafe {
-            Shell_NotifyIconW(NIM_ADD, &nid);
-        }
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) != 0 };
+        st.tray_added = added || st.tray_added;
     }
 
     fn update_tray_tooltip(st: &DaemonState) {
@@ -916,6 +1116,20 @@ mod win_daemon {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let tb_msg = TASKBAR_CREATED_MSG.load(Ordering::Relaxed);
+        if tb_msg != 0 && msg == tb_msg {
+            STATE.with(|slot| {
+                if let Some(st) = slot.borrow_mut().as_mut() {
+                    add_tray_icon(st);
+                    update_tray_tooltip(st);
+                    if let Some(hook) = &st.hook_guard {
+                        hook.reinstall();
+                    }
+                }
+            });
+            return 0;
+        }
+
         match msg {
             WM_HOTKEY | WM_APP_HOOK_HOTKEY => {
                 STATE.with(|slot| {
@@ -929,7 +1143,6 @@ mod win_daemon {
                 STATE.with(|slot| {
                     if let Some(st) = slot.borrow().as_ref() {
                         handle_clipboard_update(st);
-                        trim_working_set();
                     }
                 });
                 0
@@ -938,7 +1151,6 @@ mod win_daemon {
                 STATE.with(|slot| {
                     if let Some(st) = slot.borrow_mut().as_mut() {
                         apply_runtime_config(st);
-                        trim_working_set();
                     }
                 });
                 0
@@ -955,9 +1167,56 @@ mod win_daemon {
                 STATE.with(|slot| {
                     if let Some(st) = slot.borrow_mut().as_mut() {
                         handle_update_results(st);
-                        trim_working_set();
                     }
                 });
+                0
+            }
+            WM_WTSSESSION_CHANGE => {
+                match wparam {
+                    WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT => {
+                        STATE.with(|slot| {
+                            if let Some(st) = slot.borrow().as_ref()
+                                && let Some(hook) = &st.hook_guard
+                            {
+                                hook.reset_state();
+                            }
+                        });
+                    }
+                    WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
+                        STATE.with(|slot| {
+                            if let Some(st) = slot.borrow().as_ref()
+                                && let Some(hook) = &st.hook_guard
+                            {
+                                hook.reinstall();
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+                0
+            }
+            WM_POWERBROADCAST => {
+                match wparam {
+                    PBT_APMSUSPEND => {
+                        STATE.with(|slot| {
+                            if let Some(st) = slot.borrow().as_ref()
+                                && let Some(hook) = &st.hook_guard
+                            {
+                                hook.reset_state();
+                            }
+                        });
+                    }
+                    PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => {
+                        STATE.with(|slot| {
+                            if let Some(st) = slot.borrow().as_ref()
+                                && let Some(hook) = &st.hook_guard
+                            {
+                                hook.reinstall();
+                            }
+                        });
+                    }
+                    _ => {}
+                }
                 0
             }
             WM_TIMER => {
@@ -1003,7 +1262,11 @@ mod win_daemon {
                     unsafe {
                         SetForegroundWindow(hwnd);
                     }
-                    let _ = launch_ui_detached(&paths::exe_dir(), None);
+                    STATE.with(|slot| {
+                        if let Some(st) = slot.borrow().as_ref() {
+                            st.worker.enqueue_launch(false, None);
+                        }
+                    });
                 }
                 0
             }

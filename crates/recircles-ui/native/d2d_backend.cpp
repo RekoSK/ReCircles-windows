@@ -7,6 +7,7 @@
 #include <d2d1_1.h>
 #include <d2d1effects.h>
 #include <dcomp.h>
+#include <dwmapi.h>
 #include <dwrite_1.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -1170,11 +1171,11 @@ bool rebuild_blurred_backdrop(D2dCtx* ctx, float blur_sigma_px, float saturation
     if (!ctx || !ctx->d2d_ctx || !ctx->raw_backdrop || ctx->backdrop_w <= 0 || ctx->backdrop_h <= 0) {
         return false;
     }
-    float sigma = std::clamp(blur_sigma_px, 0.2f, 64.0f);
+    float sigma = std::clamp(blur_sigma_px, 0.05f, 64.0f);
     float sat = std::clamp(saturation, 0.5f, 2.0f);
     if (ctx->has_backdrop && ctx->backdrop_brush &&
-        std::fabs(sigma - ctx->last_blur_sigma) < 0.05f &&
-        std::fabs(sat - ctx->last_blur_sat) < 0.01f) {
+        std::fabs(sigma - ctx->last_blur_sigma) < 0.01f &&
+        std::fabs(sat - ctx->last_blur_sat) < 0.005f) {
         return true;
     }
 
@@ -1200,11 +1201,14 @@ bool rebuild_blurred_backdrop(D2dCtx* ctx, float blur_sigma_px, float saturation
     blur_fx->SetInput(0, ctx->raw_backdrop.Get());
     blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, sigma);
     blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
-    blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED);
+    // Use QUALITY for small sigmas so 1%-12% blur steps linearly without coarse downsampling jumps.
+    D2D1_GAUSSIANBLUR_OPTIMIZATION opt =
+        (sigma < 4.0f) ? D2D1_GAUSSIANBLUR_OPTIMIZATION_QUALITY : D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED;
+    blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, opt);
 
     ComPtr<ID2D1Effect> final_fx = blur_fx;
     ComPtr<ID2D1Effect> sat_fx;
-    if (std::fabs(sat - 1.0f) > 0.005f &&
+    if (std::fabs(sat - 1.0f) > 0.002f &&
         SUCCEEDED(ctx->d2d_ctx->CreateEffect(CLSID_D2D1Saturation, &sat_fx)) && sat_fx) {
         sat_fx->SetInputEffect(0, blur_fx.Get());
         sat_fx->SetValue(D2D1_SATURATION_PROP_SATURATION, sat);
@@ -1330,21 +1334,29 @@ void d2d_destroy(D2dCtx* ctx) {
 int d2d_capture_backdrop(D2dCtx* ctx, int screen_x, int screen_y, int phys_w, int phys_h, float blur_sigma_px) {
     if (!ctx || !ctx->d2d_ctx || phys_w <= 0 || phys_h <= 0) return 0;
 
-    ctx->has_backdrop = false;
-    ctx->backdrop_w = 0;
-    ctx->backdrop_h = 0;
-    ctx->last_blur_sigma = -1.0f;
-    ctx->last_blur_sat = -1.0f;
-    ctx->backdrop_brush.Reset();
-    ctx->blurred_backdrop.Reset();
-    ctx->raw_backdrop.Reset();
+    // When recapturing while visible, temporarily exclude our own HWND from screen capture
+    // via WDA_EXCLUDEFROMCAPTURE + one DwmFlush so BitBlt sees the clean desktop/windows
+    // underneath with zero visual flicker on screen, then immediately restore normal capture.
+    constexpr DWORD kWdaNone = 0x00000000;
+    constexpr DWORD kWdaExcludeFromCapture = 0x00000011;
+    bool excluded_self = false;
+    if (ctx->hwnd && IsWindowVisible(ctx->hwnd)) {
+        if (SetWindowDisplayAffinity(ctx->hwnd, kWdaExcludeFromCapture)) {
+            excluded_self = true;
+            DwmFlush();
+        }
+    }
 
     HDC screen_dc = GetDC(nullptr);
-    if (!screen_dc) return 0;
+    if (!screen_dc) {
+        if (excluded_self) SetWindowDisplayAffinity(ctx->hwnd, kWdaNone);
+        return 0;
+    }
 
     HDC mem_dc = CreateCompatibleDC(screen_dc);
     if (!mem_dc) {
         ReleaseDC(nullptr, screen_dc);
+        if (excluded_self) SetWindowDisplayAffinity(ctx->hwnd, kWdaNone);
         return 0;
     }
 
@@ -1362,6 +1374,7 @@ int d2d_capture_backdrop(D2dCtx* ctx, int screen_x, int screen_y, int phys_w, in
         if (dib) DeleteObject(dib);
         DeleteDC(mem_dc);
         ReleaseDC(nullptr, screen_dc);
+        if (excluded_self) SetWindowDisplayAffinity(ctx->hwnd, kWdaNone);
         return 0;
     }
 
@@ -1371,36 +1384,61 @@ int d2d_capture_backdrop(D2dCtx* ctx, int screen_x, int screen_y, int phys_w, in
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
 
+    if (excluded_self) {
+        SetWindowDisplayAffinity(ctx->hwnd, kWdaNone);
+    }
+
     if (!ok) {
         DeleteObject(dib);
         return 0;
     }
 
-    // D2D1_ALPHA_MODE_IGNORE treats GDI BitBlt RGBX pixels as opaque without a CPU pixel loop.
-    ComPtr<ID2D1Bitmap1> src_bmp;
-    D2D1_BITMAP_PROPERTIES1 src_props = D2D1::BitmapProperties1(
-        D2D1_BITMAP_OPTIONS_NONE,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-        96.0f, 96.0f);
-    HRESULT hr = ctx->d2d_ctx->CreateBitmap(
-        D2D1::SizeU(static_cast<UINT32>(phys_w), static_cast<UINT32>(phys_h)),
-        bits, static_cast<UINT32>(phys_w * 4), &src_props, &src_bmp);
+    // Reuse existing GPU raw_backdrop when monitor dimensions match to avoid texture churn.
+    HRESULT hr = S_OK;
+    if (ctx->raw_backdrop && ctx->backdrop_w == phys_w && ctx->backdrop_h == phys_h) {
+        hr = ctx->raw_backdrop->CopyFromMemory(nullptr, bits, static_cast<UINT32>(phys_w * 4));
+    } else {
+        ctx->has_backdrop = false;
+        ctx->backdrop_brush.Reset();
+        ctx->blurred_backdrop.Reset();
+        ctx->raw_backdrop.Reset();
+        // D2D1_ALPHA_MODE_IGNORE treats GDI BitBlt RGBX pixels as opaque without a CPU pixel loop.
+        ComPtr<ID2D1Bitmap1> src_bmp;
+        D2D1_BITMAP_PROPERTIES1 src_props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f, 96.0f);
+        hr = ctx->d2d_ctx->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(phys_w), static_cast<UINT32>(phys_h)),
+            bits, static_cast<UINT32>(phys_w * 4), &src_props, &src_bmp);
+        if (SUCCEEDED(hr) && src_bmp) {
+            ctx->raw_backdrop = std::move(src_bmp);
+            ctx->backdrop_w = phys_w;
+            ctx->backdrop_h = phys_h;
+        }
+    }
     DeleteObject(dib);
-    if (FAILED(hr) || !src_bmp) return 0;
+    if (FAILED(hr) || !ctx->raw_backdrop) return 0;
 
-    ctx->raw_backdrop = std::move(src_bmp);
-    ctx->backdrop_w = phys_w;
-    ctx->backdrop_h = phys_h;
+    ctx->last_blur_sigma = -1.0f;
+    ctx->last_blur_sat = -1.0f;
 
-    if (blur_sigma_px <= 0.05f) {
+    if (blur_sigma_px <= 0.01f) {
+        ctx->has_backdrop = false;
+        ctx->last_blur_sigma = 0.0f;
+        ctx->last_blur_sat = 1.0f;
         return 1;
     }
-    return rebuild_blurred_backdrop(ctx, blur_sigma_px, 1.18f) ? 1 : 0;
+    float def_sat = 1.0f + 0.24f * std::clamp(blur_sigma_px / (32.0f * ctx->logical_scale), 0.0f, 1.0f);
+    return rebuild_blurred_backdrop(ctx, blur_sigma_px, def_sat) ? 1 : 0;
 }
 
 int d2d_set_backdrop_blur(D2dCtx* ctx, float blur_sigma_px, float saturation) {
     if (!ctx || !ctx->raw_backdrop) return 0;
-    if (blur_sigma_px <= 0.05f) {
+    if (blur_sigma_px <= 0.01f) {
+        ctx->has_backdrop = false;
+        ctx->last_blur_sigma = 0.0f;
+        ctx->last_blur_sat = 1.0f;
         return 1;
     }
     return rebuild_blurred_backdrop(ctx, blur_sigma_px, saturation) ? 1 : 0;
@@ -1414,6 +1452,10 @@ void d2d_set_backdrop_origin(D2dCtx* ctx, float origin_x_px, float origin_y_px) 
 
 int d2d_has_backdrop(D2dCtx* ctx) {
     return (ctx && ctx->has_backdrop) ? 1 : 0;
+}
+
+int d2d_has_raw_backdrop(D2dCtx* ctx) {
+    return (ctx && ctx->raw_backdrop != nullptr) ? 1 : 0;
 }
 
 void d2d_resize(D2dCtx* ctx, int phys_w, int phys_h, float logical_scale) {

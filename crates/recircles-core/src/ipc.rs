@@ -10,6 +10,7 @@ pub const WM_APP_HOOK_HOTKEY: u32 = 0x8000 + 105;
 pub const WM_APP_CAPTURE_KEY: u32 = 0x8000 + 106;
 pub const WM_APP_UPDATE_RESULT: u32 = 0x8000 + 107;
 pub const WM_APP_CHECK_UPDATES: u32 = 0x8000 + 108;
+pub const WM_APP_BACKDROP_DIRTY: u32 = 0x8000 + 109;
 
 pub const COPYDATA_RUN_MENU: usize = 0x5243_0001;
 
@@ -29,9 +30,9 @@ pub mod win {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AllowSetForegroundWindow, BringWindowToTop, FindWindowW, GetForegroundWindow,
-        GetWindowThreadProcessId, IsWindow, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
-        SMTO_ABORTIFHUNG, WM_CLOSE,
+        AllowSetForegroundWindow, BringWindowToTop, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor,
+        GetForegroundWindow, GetWindowLongW, GetWindowThreadProcessId, IsWindow, PostMessageW,
+        SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetForegroundWindow, WM_CLOSE, WS_CHILD,
     };
 
     pub fn to_wide_nul(s: &str) -> Vec<u16> {
@@ -220,5 +221,179 @@ pub mod win {
             }
         }
         ok
+    }
+
+    /// Out-of-context WinEvent watcher that notifies a window (`WM_APP_BACKDROP_DIRTY`) whenever
+    /// external top-level windows change focus, move/resize, minimize/restore, open, close, hide,
+    /// or cloak/uncloak — keeping frosted glass backdrops live without polling or DLL injection.
+    pub struct BackdropWatch {
+        hooks: [isize; 3],
+    }
+
+    mod backdrop_watch_impl {
+        use super::*;
+        use std::cell::Cell;
+
+        type WinEventProc = unsafe extern "system" fn(
+            h_win_event_hook: isize,
+            event: u32,
+            hwnd: HWND,
+            id_object: i32,
+            id_child: i32,
+            id_event_thread: u32,
+            dwms_event_time: u32,
+        );
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetWinEventHook(
+                event_min: u32,
+                event_max: u32,
+                hmod_win_event_proc: *mut core::ffi::c_void,
+                pfn_win_event_proc: WinEventProc,
+                id_process: u32,
+                id_thread: u32,
+                dw_flags: u32,
+            ) -> isize;
+            fn UnhookWinEvent(h_win_event_hook: isize) -> i32;
+        }
+
+        const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+        const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+        const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+        const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
+        const EVENT_SYSTEM_SWITCHEND: u32 = 0x0015;
+        const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+        const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+
+        const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+        const EVENT_OBJECT_SHOW: u32 = 0x8002;
+        const EVENT_OBJECT_HIDE: u32 = 0x8003;
+        const EVENT_OBJECT_CLOAKED: u32 = 0x8017;
+        const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
+
+        const OBJID_WINDOW: i32 = 0;
+        const CHILDID_SELF: i32 = 0;
+
+        thread_local! {
+            static TARGET_HWND: Cell<usize> = const { Cell::new(0) };
+            static NOTIFIED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn is_top_level_event_window(hwnd: HWND) -> bool {
+            if hwnd.is_null() {
+                return false;
+            }
+            let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+            if (style & WS_CHILD) != 0 {
+                return false;
+            }
+            let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+            root.is_null() || root == hwnd
+        }
+
+        unsafe extern "system" fn win_event_proc(
+            _hook: isize,
+            event: u32,
+            hwnd: HWND,
+            id_object: i32,
+            id_child: i32,
+            _thread: u32,
+            _time: u32,
+        ) {
+            let relevant = match event {
+                EVENT_SYSTEM_FOREGROUND
+                | EVENT_SYSTEM_MOVESIZEEND
+                | EVENT_SYSTEM_SWITCHEND
+                | EVENT_SYSTEM_MINIMIZESTART
+                | EVENT_SYSTEM_MINIMIZEEND => true,
+                EVENT_OBJECT_DESTROY
+                | EVENT_OBJECT_SHOW
+                | EVENT_OBJECT_HIDE
+                | EVENT_OBJECT_CLOAKED
+                | EVENT_OBJECT_UNCLOAKED => {
+                    id_object == OBJID_WINDOW
+                        && id_child == CHILDID_SELF
+                        && is_top_level_event_window(hwnd)
+                }
+                _ => false,
+            };
+            if !relevant {
+                return;
+            }
+            let target = TARGET_HWND.with(Cell::get) as HWND;
+            if target.is_null() || target == hwnd {
+                return;
+            }
+            let already = NOTIFIED.with(|n| n.replace(true));
+            if !already {
+                unsafe {
+                    PostMessageW(target, WM_APP_BACKDROP_DIRTY, event as usize, 0);
+                }
+            }
+        }
+
+        impl BackdropWatch {
+            pub fn install(hwnd: HWND) -> Self {
+                TARGET_HWND.with(|t| t.set(hwnd as usize));
+                NOTIFIED.with(|n| n.set(false));
+                let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+                let h1 = unsafe {
+                    SetWinEventHook(
+                        EVENT_SYSTEM_FOREGROUND,
+                        EVENT_SYSTEM_MINIMIZEEND,
+                        std::ptr::null_mut(),
+                        win_event_proc,
+                        0,
+                        0,
+                        flags,
+                    )
+                };
+                let h2 = unsafe {
+                    SetWinEventHook(
+                        EVENT_OBJECT_DESTROY,
+                        EVENT_OBJECT_HIDE,
+                        std::ptr::null_mut(),
+                        win_event_proc,
+                        0,
+                        0,
+                        flags,
+                    )
+                };
+                let h3 = unsafe {
+                    SetWinEventHook(
+                        EVENT_OBJECT_CLOAKED,
+                        EVENT_OBJECT_UNCLOAKED,
+                        std::ptr::null_mut(),
+                        win_event_proc,
+                        0,
+                        0,
+                        flags,
+                    )
+                };
+                Self {
+                    hooks: [h1, h2, h3],
+                }
+            }
+
+            pub fn ack(&self) {
+                NOTIFIED.with(|n| n.set(false));
+            }
+        }
+
+        impl Drop for BackdropWatch {
+            fn drop(&mut self) {
+                for h in self.hooks {
+                    if h != 0 {
+                        unsafe {
+                            UnhookWinEvent(h);
+                        }
+                    }
+                }
+                TARGET_HWND.with(|t| t.set(0));
+                NOTIFIED.with(|n| n.set(false));
+            }
+        }
     }
 }

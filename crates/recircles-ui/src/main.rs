@@ -210,9 +210,10 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
     use app::{App, BackendBridge, UiEffect};
     use icon_loader::WM_APP_ICON_READY;
     use recircles_core::ipc::{
-        UI_WINDOW_CLASS, WM_APP_CAPTURE_KEY, WM_APP_CLOSE_UI,
+        UI_WINDOW_CLASS, WM_APP_BACKDROP_DIRTY, WM_APP_CAPTURE_KEY, WM_APP_CLOSE_UI,
         win::{
-            close_existing_ui_instances, force_foreground_window, notify_daemon_reload, to_wide_nul,
+            BackdropWatch, close_existing_ui_instances, force_foreground_window,
+            notify_daemon_reload, to_wide_nul,
         },
     };
     use recircles_core::modules::{BuiltinSubmenu, host::SubmenuHost};
@@ -247,15 +248,18 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-        GetMessageW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage,
-        RegisterClassExW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WM_ACTIVATEAPP,
-        WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR,
-        WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        GetMessageW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSG,
+        PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+        WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+        WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
+    const TIMER_BACKDROP_REFRESH: usize = 10;
+    const TIMER_BACKDROP_SETTLE: usize = 11;
 
     struct WinDllBridge {
         host: SubmenuHost,
@@ -292,8 +296,11 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         app: App,
         renderer: Renderer,
         pacer: VsyncPacer,
+        mon_x: i32,
+        mon_y: i32,
         mon_w: i32,
         mon_h: i32,
+        dpi_scale: f64,
         anchor_px: (f64, f64),
         total_scale: f64,
         last_tick: Instant,
@@ -305,6 +312,8 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         pointer_capture: bool,
         last_mouse_phys: (i32, i32),
         capture_hook: Option<CaptureHook>,
+        backdrop_watch: Option<BackdropWatch>,
+        backdrop_stale: bool,
     }
 
     thread_local! {
@@ -402,8 +411,11 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         app,
         renderer,
         pacer,
+        mon_x,
+        mon_y,
         mon_w,
         mon_h,
+        dpi_scale,
         anchor_px,
         total_scale,
         last_tick: Instant::now(),
@@ -415,6 +427,8 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         pointer_capture: false,
         last_mouse_phys: (pt.x - mon_x, pt.y - mon_y),
         capture_hook: None,
+        backdrop_watch: Some(BackdropWatch::install(hwnd)),
+        backdrop_stale: false,
     };
     paint_frame(&mut rt);
 
@@ -437,6 +451,22 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         drop(slot.borrow_mut().take());
     });
     return ExitCode::SUCCESS;
+
+    fn refresh_ui_backdrop(rt: &mut UiRuntime) {
+        if rt.app.closing {
+            return;
+        }
+        let need_blur = !rt.app.cfg.appearance.high_contrast
+            && rt.app.cfg.appearance.translucency > 0
+            && rt.app.cfg.appearance.blur > 0;
+        if !need_blur {
+            rt.backdrop_stale = true;
+            return;
+        }
+        rt.renderer
+            .capture_backdrop(rt.mon_x, rt.mon_y, rt.dpi_scale, rt.app.cfg.appearance.blur);
+        rt.backdrop_stale = false;
+    }
 
     fn request_paint(rt: &mut UiRuntime) {
         if !rt.was_animating {
@@ -476,7 +506,9 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
     fn paint_frame(rt: &mut UiRuntime) {
         rt.needs_paint = false;
         let dpi = unsafe { GetDpiForWindow(rt.hwnd) }.max(96) as f64;
-        let new_scale = ((dpi / 96.0) * rt.app.cfg.appearance.scale).clamp(0.5, 4.0);
+        let dpi_scale = dpi / 96.0;
+        rt.dpi_scale = dpi_scale;
+        let new_scale = (dpi_scale * rt.app.cfg.appearance.scale).clamp(0.5, 4.0);
         if (new_scale - rt.total_scale).abs() > 1e-4 {
             let old_scale = rt.total_scale;
             rt.total_scale = new_scale;
@@ -487,6 +519,14 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 rt.anchor_px.0 / new_scale,
                 rt.anchor_px.1 / new_scale,
             );
+        }
+        if rt.backdrop_stale
+            && !rt.app.closing
+            && !rt.app.cfg.appearance.high_contrast
+            && rt.app.cfg.appearance.translucency > 0
+            && rt.app.cfg.appearance.blur > 0
+        {
+            refresh_ui_backdrop(rt);
         }
         rt.renderer.render_and_present(rt.total_scale, &rt.app);
         let is_anim = rt.app.is_animating()
@@ -703,6 +743,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                         rt.app.import_theme_from_path(&path);
                     }
                 }
+                refresh_ui_backdrop(rt);
                 paint_frame(rt);
             }
         });
@@ -1020,12 +1061,66 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 }
                 0
             }
+            WM_APP_BACKDROP_DIRTY => {
+                let mut should_schedule = false;
+                RT.with(|slot| {
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && let Some(rt) = guard.as_mut()
+                    {
+                        if let Some(watch) = &rt.backdrop_watch {
+                            watch.ack();
+                        }
+                        if !rt.app.closing {
+                            should_schedule = true;
+                        }
+                    }
+                });
+                if should_schedule {
+                    unsafe {
+                        KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+                        SetTimer(hwnd, TIMER_BACKDROP_REFRESH, 45, None);
+                    }
+                }
+                0
+            }
+            WM_DISPLAYCHANGE => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+                    SetTimer(hwnd, TIMER_BACKDROP_REFRESH, 60, None);
+                }
+                0
+            }
+            WM_TIMER => {
+                let timer_id = wparam;
+                if timer_id == TIMER_BACKDROP_REFRESH || timer_id == TIMER_BACKDROP_SETTLE {
+                    unsafe { KillTimer(hwnd, timer_id) };
+                    let mut arm_settle = false;
+                    RT.with(|slot| {
+                        if let Ok(mut guard) = slot.try_borrow_mut()
+                            && let Some(rt) = guard.as_mut()
+                            && !rt.app.closing
+                            && !rt.picking_file
+                        {
+                            refresh_ui_backdrop(rt);
+                            paint_frame(rt);
+                            if timer_id == TIMER_BACKDROP_REFRESH {
+                                arm_settle = true;
+                            }
+                        }
+                    });
+                    if arm_settle {
+                        unsafe { SetTimer(hwnd, TIMER_BACKDROP_SETTLE, 320, None) };
+                    }
+                }
+                0
+            }
             WM_DPICHANGED => {
                 let new_dpi = ((wparam & 0xFFFF) as u32).max(96) as f64;
                 let suggested = lparam as *const RECT;
                 RT.with(|slot| {
                     if let Some(rt) = slot.borrow_mut().as_mut() {
-                        let new_scale = ((new_dpi / 96.0) * rt.app.cfg.appearance.scale).clamp(0.5, 4.0);
+                        let new_dpi_scale = new_dpi / 96.0;
+                        let new_scale = (new_dpi_scale * rt.app.cfg.appearance.scale).clamp(0.5, 4.0);
                         if !suggested.is_null() {
                             let rc = unsafe { *suggested };
                             let nw = (rc.right - rc.left).max(320);
@@ -1041,12 +1136,16 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                                     SWP_NOZORDER | SWP_NOACTIVATE,
                                 );
                             }
+                            rt.mon_x = rc.left;
+                            rt.mon_y = rc.top;
                             rt.mon_w = nw;
                             rt.mon_h = nh;
                             rt.renderer.resize(nw, nh, new_scale);
                         }
                         let old_scale = rt.total_scale;
+                        rt.dpi_scale = new_dpi_scale;
                         rt.total_scale = new_scale;
+                        refresh_ui_backdrop(rt);
                         rt.app.rescale_hover(old_scale / new_scale);
                         rt.app.set_viewport(
                             rt.mon_w as f64 / new_scale,
@@ -1075,11 +1174,16 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 0
             }
             WM_DESTROY => {
+                unsafe {
+                    KillTimer(hwnd, TIMER_BACKDROP_REFRESH);
+                    KillTimer(hwnd, TIMER_BACKDROP_SETTLE);
+                }
                 RT.with(|slot| {
                     if let Ok(mut guard) = slot.try_borrow_mut()
                         && let Some(rt) = guard.as_mut()
                     {
                         sync_capture_hook(rt, true);
+                        rt.backdrop_watch = None;
                     }
                 });
                 unsafe { PostQuitMessage(0) };

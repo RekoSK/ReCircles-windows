@@ -4130,11 +4130,22 @@ mod tests {
         app.handle_key_down(Modifiers::default(), 0x46, Some('f'));
         app.handle_key_down(Modifiers::default(), 0x49, Some('i'));
         assert_eq!(app.menu.query, "fi");
+        let count_before_completion = app.menu.filtered.len();
         assert_eq!(app.inline_suggestion().as_deref(), Some("refox"));
         app.handle_key_down(Modifiers::default(), VK_RIGHT, None);
         assert_eq!(app.menu.query, "Firefox");
+        assert_eq!(
+            app.menu.selected_entry().map(|e| e.title.as_str()),
+            Some("Firefox")
+        );
+        assert!(app
+            .menu
+            .filtered
+            .iter()
+            .all(|&idx| app.menu.items[idx].title.to_ascii_lowercase().contains("firefox")));
         app.handle_key_down(Modifiers::default(), VK_LEFT, None);
         assert_eq!(app.menu.query, "fi");
+        assert_eq!(app.menu.filtered.len(), count_before_completion);
         app.handle_key_down(ctrl, 0x55, Some('u')); // Ctrl+u clears query
         assert_eq!(app.menu.query, "");
         app.handle_key_down(Modifiers::default(), VK_ESCAPE, None); // Esc steps back to "fi"

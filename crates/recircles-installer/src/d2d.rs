@@ -166,6 +166,7 @@ unsafe extern "C" {
     fn d2d_set_backdrop_blur(ctx: *mut c_void, blur_sigma_px: f32, saturation: f32) -> i32;
     fn d2d_set_backdrop_origin(ctx: *mut c_void, origin_x_px: f32, origin_y_px: f32);
     fn d2d_has_backdrop(ctx: *mut c_void) -> i32;
+    fn d2d_has_raw_backdrop(ctx: *mut c_void) -> i32;
     fn d2d_fill_rounded_rect_backdrop(
         ctx: *mut c_void,
         x: f32,
@@ -470,6 +471,10 @@ impl D2dCanvas {
 
     pub fn has_backdrop(&self) -> bool {
         unsafe { d2d_has_backdrop(self.ptr) != 0 }
+    }
+
+    pub fn has_raw_backdrop(&self) -> bool {
+        unsafe { d2d_has_raw_backdrop(self.ptr) != 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
