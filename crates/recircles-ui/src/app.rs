@@ -93,6 +93,9 @@ pub enum UiEffect {
     None,
     CloseApp,
     FocusWindow { hwnd: u64, close_now: bool },
+    LaunchApp { id: String, launch_target: String },
+    OpenFile { path: String },
+    OpenFolder { path: String },
     NotifyDaemonReload,
     PickThemeFile,
     PickMenuFile,
@@ -474,11 +477,13 @@ impl App {
         };
         self.history.bump_path(&dir);
         let _ = self.history.save();
-        match self.backend.invoke(
-            BuiltinSubmenu::Files,
-            &SubmenuRequest::FilesOpenFolder { path: dir },
-        ) {
-            Ok(SubmenuResponse::ActionOutcome { ok: false, message }) => {
+        UiEffect::OpenFolder { path: dir }
+    }
+
+    pub fn finish_external_action(&mut self, result: Result<SubmenuResponse, String>) -> UiEffect {
+        match result {
+            Ok(SubmenuResponse::ActionOutcome { ok: false, message })
+            | Ok(SubmenuResponse::Error { message }) => {
                 self.notice = Some(message);
                 UiEffect::None
             }
@@ -2592,15 +2597,13 @@ impl App {
                         self.history.bump_path(&parent.to_string_lossy());
                         let _ = self.history.save();
                     }
-                    let _ = self.backend.invoke(
-                        BuiltinSubmenu::Files,
-                        &SubmenuRequest::FilesOpenFolder { path: entry.payload },
-                    );
-                    return self.begin_close();
+                    // Defer ShellExecute to UiEffect so COM/Shell message pumping runs AFTER
+                    // the Win32 WndProc releases its RefCell borrow on UiRuntime and mouse capture.
+                    return UiEffect::OpenFolder {
+                        path: entry.payload,
+                    };
                 }
                 if entry.completion.as_ref().is_some_and(|c| c.ends_with('\\') || c.ends_with('/')) {
-                    self.history.bump_path(&entry.payload);
-                    let _ = self.history.save();
                     let next_query = entry.completion.unwrap();
                     if self.menu.query != next_query {
                         let current = self.menu.query.clone();
@@ -2613,31 +2616,18 @@ impl App {
                 }
                 self.history.bump_path(&entry.payload);
                 let _ = self.history.save();
-                let _ = self.backend.invoke(
-                    BuiltinSubmenu::Files,
-                    &SubmenuRequest::FilesOpen { path: entry.payload },
-                );
-                self.begin_close()
+                UiEffect::OpenFile {
+                    path: entry.payload,
+                }
             }
             Mode::Apps => {
                 self.history.bump_app(&entry.key);
                 let _ = self.history.save();
-                match self.backend.invoke(
-                    BuiltinSubmenu::Apps,
-                    &SubmenuRequest::AppsLaunch {
-                        id: entry.key,
-                        launch_target: entry.payload,
-                    },
-                ) {
-                    Ok(SubmenuResponse::ActionOutcome { ok: false, message }) => {
-                        self.notice = Some(message);
-                        UiEffect::None
-                    }
-                    Err(e) => {
-                        self.notice = Some(e);
-                        UiEffect::None
-                    }
-                    _ => self.begin_close(),
+                // Defer ShellExecute to UiEffect so COM/Shell message pumping runs AFTER
+                // the Win32 WndProc releases its RefCell borrow on UiRuntime and mouse capture.
+                UiEffect::LaunchApp {
+                    id: entry.key,
+                    launch_target: entry.payload,
                 }
             }
             Mode::Windows => {
@@ -3543,6 +3533,25 @@ mod tests {
         assert_eq!(eff_win_alone, UiEffect::NotifyDaemonReload);
         assert_eq!(app.cfg.keybinds.main_menu.primary(), Some("Win"));
 
+        // Capture Alt+Tab for the Windows (Alt-Tab) submenu succeeds and emits NotifyDaemonReload
+        app.handle_settings_action(SettingsAction::CaptureMenuHotkey {
+            menu_id: Some("windows".into()),
+            label: "Alt-Tab".into(),
+        });
+        let eff_alt_tab = app.handle_key_down(
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            VK_TAB,
+            None,
+        );
+        assert_eq!(eff_alt_tab, UiEffect::NotifyDaemonReload);
+        assert_eq!(
+            app.cfg.keybinds.menu_hotkey("windows").primary(),
+            Some("Alt+Tab")
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4221,13 +4230,17 @@ mod tests {
         app.handle_key_down(Modifiers::default(), VK_RIGHT, None);
         assert_eq!(app.menu.query, sub2_str);
 
-        // Alt+Enter opens current folder (sub2) and closes
+        // Alt+Enter defers opening current folder (sub2) to UiEffect::OpenFolder
+        backend.calls.lock().unwrap().clear();
         let eff = app.handle_key_down(alt, VK_RETURN, None);
-        assert!(matches!(eff, UiEffect::CloseApp) || app.closing);
+        assert!(matches!(eff, UiEffect::OpenFolder { ref path } if path.contains("smth2")));
         let calls = backend.calls.lock().unwrap().clone();
-        assert!(calls
-            .iter()
-            .any(|c| c.contains("files_open_folder") && c.contains("smth2")));
+        assert!(!calls.iter().any(|c| c.contains("files_open_folder")));
+        let follow = app.finish_external_action(Ok(SubmenuResponse::ActionOutcome {
+            ok: true,
+            message: "ok".into(),
+        }));
+        assert!(matches!(follow, UiEffect::CloseApp) || app.closing);
 
         // Shift+Escape (home) jumps directly back to Main Menu
         app.closing = false;
@@ -4426,6 +4439,168 @@ mod tests {
         // Verify persisted to recircles.json
         let reloaded = app.store.load_or_create(&app.installed).unwrap();
         assert_eq!(reloaded.appearance.blur, 6);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_recent_folders_only_records_explicit_open_not_browsing() {
+        let (dir, mut app, _backend) = temp_app(false);
+        let browse_dir = dir.join("BrowseOnly");
+        let right_click_dir = dir.join("RightClicked");
+        let alt_enter_dir = dir.join("AltEntered");
+        std::fs::create_dir_all(&browse_dir).unwrap();
+        std::fs::create_dir_all(&right_click_dir).unwrap();
+        std::fs::create_dir_all(&alt_enter_dir).unwrap();
+
+        let browse_str = format!("{}\\", browse_dir.display());
+        let rc_str = format!("{}\\", right_click_dir.display());
+        let ae_str = format!("{}\\", alt_enter_dir.display());
+
+        app.open_menu_target("files", false).unwrap();
+
+        // 1. Navigating into a folder via primary activation (Enter / left-click) must NOT record it.
+        let browse_entry = Entry {
+            key: browse_str.clone(),
+            title: "BrowseOnly".into(),
+            detail: browse_str.clone(),
+            icon: BuiltinIcon::Folder,
+            icon_path: None,
+            exe_icon_path: None,
+            accent_override: None,
+            active: false,
+            completion: Some(browse_str.clone()),
+            payload: browse_str.clone(),
+            secondary_payload: None,
+        };
+        app.menu.items = vec![browse_entry];
+        app.menu.filtered = vec![0];
+        app.menu.selected = Some(0);
+        app.activate_selected(false);
+        assert!(app.history.recent_path_keys().is_empty());
+
+        // 2. Right-clicking (secondary activation) a folder DOES record it.
+        let rc_entry = Entry {
+            key: rc_str.clone(),
+            title: "RightClicked".into(),
+            detail: rc_str.clone(),
+            icon: BuiltinIcon::Folder,
+            icon_path: None,
+            exe_icon_path: None,
+            accent_override: None,
+            active: false,
+            completion: Some(rc_str.clone()),
+            payload: rc_str.clone(),
+            secondary_payload: None,
+        };
+        app.menu.items = vec![rc_entry];
+        app.menu.filtered = vec![0];
+        app.menu.selected = Some(0);
+        app.activate_selected(true);
+        assert_eq!(
+            app.history.recent_path_keys(),
+            vec![right_click_dir.to_string_lossy().into_owned()]
+        );
+
+        // 3. Alt+Enter (open_current_folder) DOES record the current folder.
+        app.menu.query = ae_str;
+        app.open_current_folder();
+        assert_eq!(
+            app.history.recent_path_keys(),
+            vec![
+                alt_enter_dir.to_string_lossy().into_owned(),
+                right_click_dir.to_string_lossy().into_owned(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apps_and_files_activation_defer_shell_execute_to_ui_effect_without_sync_invoke() {
+        let (dir, mut app, backend) = temp_app(true);
+        app.set_viewport(1200.0, 800.0, 600.0, 400.0);
+        app.ring_motion.advance(5.0);
+
+        // 1. Apps mode: activating an app bumps history and defers AppsLaunch to UiEffect::LaunchApp
+        app.mode = Mode::Apps;
+        app.apply_apps_list(vec![recircles_core::submenu_abi::AppDto {
+            id: "app:Notepad".into(),
+            name: "Notepad".into(),
+            launch_target: "C:\\Windows\\System32\\notepad.exe".into(),
+            icon_path: "C:\\Windows\\System32\\notepad.exe".into(),
+        }]);
+        backend.calls.lock().unwrap().clear();
+
+        let eff = app.activate_selected(false);
+        assert_eq!(
+            eff,
+            UiEffect::LaunchApp {
+                id: "app:Notepad".into(),
+                launch_target: "C:\\Windows\\System32\\notepad.exe".into(),
+            }
+        );
+        assert_eq!(app.history.app_score("app:Notepad"), 1);
+        assert!(!app.closing);
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("apps_launch")),
+            "AppsLaunch must be deferred to UiEffect::LaunchApp to prevent Win32 WndProc RefCell re-entrancy"
+        );
+
+        // Failure outcome surfaces notice without closing; success outcome starts close
+        let fail_eff = app.finish_external_action(Ok(SubmenuResponse::ActionOutcome {
+            ok: false,
+            message: "Launch failed".into(),
+        }));
+        assert_eq!(fail_eff, UiEffect::None);
+        assert!(!app.closing);
+        assert_eq!(app.notice.as_deref(), Some("Launch failed"));
+
+        let ok_eff = app.finish_external_action(Ok(SubmenuResponse::ActionOutcome {
+            ok: true,
+            message: "Launched".into(),
+        }));
+        assert!(matches!(ok_eff, UiEffect::CloseApp) || app.closing);
+
+        // 2. Files mode: opening a file defers FilesOpen to UiEffect::OpenFile
+        app.closing = false;
+        app.open_menu_target("files", false).unwrap();
+        let sample_file = dir.join("note.txt");
+        std::fs::write(&sample_file, b"hi").unwrap();
+        let file_str = sample_file.to_string_lossy().into_owned();
+        app.menu.items = vec![Entry {
+            key: file_str.clone(),
+            title: "note.txt".into(),
+            detail: file_str.clone(),
+            icon: BuiltinIcon::File,
+            icon_path: None,
+            exe_icon_path: None,
+            accent_override: None,
+            active: false,
+            completion: Some(file_str.clone()),
+            payload: file_str.clone(),
+            secondary_payload: None,
+        }];
+        app.menu.filtered = vec![0];
+        app.menu.selected = Some(0);
+        backend.calls.lock().unwrap().clear();
+
+        let file_eff = app.activate_selected(false);
+        assert_eq!(file_eff, UiEffect::OpenFile { path: file_str });
+        assert!(
+            !backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("files_open")),
+            "FilesOpen must be deferred to UiEffect::OpenFile"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

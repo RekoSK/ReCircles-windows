@@ -247,14 +247,14 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-        GetMessageW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSG,
-        PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
-        WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-        WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow,
+        DispatchMessageW, GetCursorPos, GetMessageW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
+        IsWindow, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+        SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+        SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_ACTIVATEAPP, WM_CAPTURECHANGED,
+        WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR,
+        WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
@@ -307,6 +307,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         opened_at: Instant,
         activated_once: bool,
         picking_file: bool,
+        launching_external: bool,
         was_animating: bool,
         needs_paint: bool,
         pointer_capture: bool,
@@ -422,6 +423,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         opened_at: Instant::now(),
         activated_once: false,
         picking_file: false,
+        launching_external: false,
         was_animating: false,
         needs_paint: false,
         pointer_capture: false,
@@ -693,7 +695,9 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
 
     fn run_file_picker(hwnd: HWND, is_menu: bool) {
         RT.with(|slot| {
-            if let Some(rt) = slot.borrow_mut().as_mut() {
+            if let Ok(mut guard) = slot.try_borrow_mut()
+                && let Some(rt) = guard.as_mut()
+            {
                 rt.picking_file = true;
                 if rt.pointer_capture {
                     rt.pointer_capture = false;
@@ -734,7 +738,9 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
         }
         let mut follow_eff = UiEffect::None;
         RT.with(|slot| {
-            if let Some(rt) = slot.borrow_mut().as_mut() {
+            if let Ok(mut guard) = slot.try_borrow_mut()
+                && let Some(rt) = guard.as_mut()
+            {
                 rt.picking_file = false;
                 if let Some(path) = picked {
                     if is_menu {
@@ -745,6 +751,50 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 }
                 refresh_ui_backdrop(rt);
                 paint_frame(rt);
+            }
+        });
+        handle_effect(hwnd, follow_eff);
+    }
+
+    fn run_external_submenu_action(hwnd: HWND, sub: BuiltinSubmenu, req: SubmenuRequest) {
+        let mut backend_opt = None;
+        let mut release_capture = false;
+        RT.with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut()
+                && let Some(rt) = guard.as_mut()
+            {
+                if rt.launching_external {
+                    return;
+                }
+                rt.launching_external = true;
+                if rt.pointer_capture {
+                    rt.pointer_capture = false;
+                    release_capture = true;
+                }
+                backend_opt = Some(rt.app.backend.clone());
+            }
+        });
+        let Some(backend) = backend_opt else {
+            return;
+        };
+        if release_capture {
+            unsafe { ReleaseCapture() };
+        }
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let result = backend.invoke(sub, &req);
+        let mut follow_eff = UiEffect::None;
+        RT.with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut()
+                && let Some(rt) = guard.as_mut()
+            {
+                rt.launching_external = false;
+                follow_eff = rt.app.finish_external_action(result);
+                sync_capture_hook(rt, closes_immediately(&follow_eff));
+                if !closes_immediately(&follow_eff) {
+                    paint_frame(rt);
+                }
             }
         });
         handle_effect(hwnd, follow_eff);
@@ -765,6 +815,27 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
             UiEffect::NotifyDaemonReload => {
                 let _ = notify_daemon_reload();
             }
+            UiEffect::LaunchApp { id, launch_target } => {
+                run_external_submenu_action(
+                    hwnd,
+                    BuiltinSubmenu::Apps,
+                    SubmenuRequest::AppsLaunch { id, launch_target },
+                );
+            }
+            UiEffect::OpenFile { path } => {
+                run_external_submenu_action(
+                    hwnd,
+                    BuiltinSubmenu::Files,
+                    SubmenuRequest::FilesOpen { path },
+                );
+            }
+            UiEffect::OpenFolder { path } => {
+                run_external_submenu_action(
+                    hwnd,
+                    BuiltinSubmenu::Files,
+                    SubmenuRequest::FilesOpenFolder { path },
+                );
+            }
             UiEffect::FocusWindow {
                 hwnd: target_hwnd,
                 close_now,
@@ -781,13 +852,15 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                         &SubmenuRequest::WindowsFocus { hwnd: target_hwnd },
                     );
                 }
-                if close_now {
+                if close_now && unsafe { IsWindow(hwnd) } != 0 {
                     unsafe { DestroyWindow(hwnd) };
                 }
             }
             UiEffect::CloseApp => unsafe {
                 ReleaseCapture();
-                DestroyWindow(hwnd);
+                if IsWindow(hwnd) != 0 {
+                    DestroyWindow(hwnd);
+                }
             },
         }
     }
@@ -802,32 +875,54 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
             WM_ERASEBKGND => 1,
             WM_APP_TICK => {
                 let mut effects_out = Vec::new();
-                RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
-                        rt.pacer.ack_tick();
-                        let now = Instant::now();
-                        let dt = (now - rt.last_tick).as_secs_f64().clamp(0.0, 0.05);
-                        rt.last_tick = now;
-                        effects_out = rt.app.tick(dt);
-                        if !effects_out.iter().any(|e| matches!(e, UiEffect::CloseApp)) {
-                            paint_frame(rt);
+                let mut repost = false;
+                RT.with(|slot| match slot.try_borrow_mut() {
+                    Ok(mut guard) => {
+                        if let Some(rt) = guard.as_mut() {
+                            rt.pacer.ack_tick();
+                            let now = Instant::now();
+                            let dt = (now - rt.last_tick).as_secs_f64().clamp(0.0, 0.05);
+                            rt.last_tick = now;
+                            effects_out = rt.app.tick(dt);
+                            if !effects_out.iter().any(|e| matches!(e, UiEffect::CloseApp)) {
+                                paint_frame(rt);
+                            }
                         }
                     }
+                    Err(_) => {
+                        repost = true;
+                    }
                 });
+                if repost {
+                    unsafe {
+                        PostMessageW(hwnd, WM_APP_TICK, 0, 0);
+                    }
+                }
                 for eff in effects_out {
                     handle_effect(hwnd, eff);
                 }
                 0
             }
             WM_APP_ICON_READY => {
-                RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
-                        rt.renderer.ack_icon_notify();
-                        if rt.renderer.drain_ready_icons(16) {
-                            request_paint(rt);
+                let mut repost = false;
+                RT.with(|slot| match slot.try_borrow_mut() {
+                    Ok(mut guard) => {
+                        if let Some(rt) = guard.as_mut() {
+                            rt.renderer.ack_icon_notify();
+                            if rt.renderer.drain_ready_icons(16) {
+                                request_paint(rt);
+                            }
                         }
                     }
+                    Err(_) => {
+                        repost = true;
+                    }
                 });
+                if repost {
+                    unsafe {
+                        PostMessageW(hwnd, WM_APP_ICON_READY, 0, 0);
+                    }
+                }
                 0
             }
             WM_APP_CAPTURE_KEY => {
@@ -858,23 +953,26 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wparam as u32;
                 let mods = current_mods();
-                let handled_by_hook = RT.with(|slot| {
+                let skip_key = RT.with(|slot| {
                     slot.try_borrow()
                         .ok()
                         .and_then(|g| {
-                            g.as_ref()
-                                .map(|rt| rt.app.capture.is_some() && rt.capture_hook.is_some())
+                            g.as_ref().map(|rt| {
+                                rt.launching_external
+                                    || (rt.app.capture.is_some() && rt.capture_hook.is_some())
+                            })
                         })
                         .unwrap_or(false)
                 });
-                if handled_by_hook {
+                if skip_key {
                     return 0;
                 }
                 if mods.ctrl && !mods.alt && !mods.win && vk == 0x56 {
                     let clip = read_clipboard_unicode_text(hwnd);
                     let mut handled_paste = false;
                     RT.with(|slot| {
-                        if let Some(rt) = slot.borrow_mut().as_mut()
+                        if let Ok(mut guard) = slot.try_borrow_mut()
+                            && let Some(rt) = guard.as_mut()
                             && rt.app.capture.is_none()
                         {
                             if let Some(txt) = clip {
@@ -909,7 +1007,9 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 let px_i = (lparam & 0xFFFF) as i16 as i32;
                 let py_i = ((lparam >> 16) & 0xFFFF) as i16 as i32;
                 RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && let Some(rt) = guard.as_mut()
+                    {
                         // Ignore Windows's synthetic WM_MOUSEMOVE on ShowWindow when the cursor
                         // has not moved so initial keyboard/list selection is never hijacked.
                         if (px_i, py_i) == rt.last_mouse_phys && !rt.app.is_dragging() {
@@ -935,7 +1035,12 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                 let mut pending_eff = UiEffect::None;
                 let mut want_capture = false;
                 RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && let Some(rt) = guard.as_mut()
+                    {
+                        if rt.launching_external {
+                            return;
+                        }
                         rt.last_mouse_phys = (px_i, py_i);
                         let lx = px_i as f64 / rt.total_scale;
                         let ly = py_i as f64 / rt.total_scale;
@@ -950,7 +1055,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                             rt.pointer_capture = true;
                             want_capture = true;
                         }
-                        if !matches!(pending_eff, UiEffect::CloseApp) {
+                        if !closes_immediately(&pending_eff) {
                             paint_frame(rt);
                         }
                     }
@@ -971,6 +1076,9 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                     if let Ok(mut guard) = slot.try_borrow_mut()
                         && let Some(rt) = guard.as_mut()
                     {
+                        if rt.launching_external {
+                            return;
+                        }
                         rt.last_mouse_phys = (px_i, py_i);
                         if rt.pointer_capture {
                             rt.pointer_capture = false;
@@ -995,7 +1103,8 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
             WM_MOUSEWHEEL => {
                 let delta = ((wparam >> 16) as i16) as f64;
                 RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut()
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && let Some(rt) = guard.as_mut()
                         && rt.app.handle_wheel(delta)
                     {
                         request_paint(rt);
@@ -1015,20 +1124,33 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                     });
                     unsafe {
                         ReleaseCapture();
-                        DestroyWindow(hwnd);
+                        if IsWindow(hwnd) != 0 {
+                            DestroyWindow(hwnd);
+                        }
                     }
                     return 0;
                 }
                 let mut pending_eff = UiEffect::None;
-                RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
-                        pending_eff = rt.app.begin_close();
-                        sync_capture_hook(rt, true);
-                        if !matches!(pending_eff, UiEffect::CloseApp) {
-                            paint_frame(rt);
+                let mut repost = false;
+                RT.with(|slot| match slot.try_borrow_mut() {
+                    Ok(mut guard) => {
+                        if let Some(rt) = guard.as_mut() {
+                            pending_eff = rt.app.begin_close();
+                            sync_capture_hook(rt, true);
+                            if !closes_immediately(&pending_eff) {
+                                paint_frame(rt);
+                            }
                         }
                     }
+                    Err(_) => {
+                        repost = true;
+                    }
                 });
+                if repost {
+                    unsafe {
+                        PostMessageW(hwnd, WM_APP_CLOSE_UI, wparam, lparam);
+                    }
+                }
                 handle_effect(hwnd, pending_eff);
                 0
             }
@@ -1047,6 +1169,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                         if let Ok(mut guard) = slot.try_borrow_mut()
                             && let Some(rt) = guard.as_mut()
                             && !rt.picking_file
+                            && !rt.launching_external
                             && (rt.activated_once
                                 || rt.opened_at.elapsed() >= std::time::Duration::from_millis(250))
                         {
@@ -1100,6 +1223,7 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
                             && let Some(rt) = guard.as_mut()
                             && !rt.app.closing
                             && !rt.picking_file
+                            && !rt.launching_external
                         {
                             refresh_ui_backdrop(rt);
                             paint_frame(rt);
@@ -1117,25 +1241,35 @@ fn run_gui(store: ConfigStore, installed: InstalledModules, start: Option<String
             WM_DPICHANGED => {
                 let new_dpi = ((wparam & 0xFFFF) as u32).max(96) as f64;
                 let suggested = lparam as *const RECT;
+                let suggested_rc = if !suggested.is_null() {
+                    Some(unsafe { *suggested })
+                } else {
+                    None
+                };
+                if let Some(rc) = suggested_rc {
+                    let nw = (rc.right - rc.left).max(320);
+                    let nh = (rc.bottom - rc.top).max(240);
+                    unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            rc.left,
+                            rc.top,
+                            nw,
+                            nh,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
                 RT.with(|slot| {
-                    if let Some(rt) = slot.borrow_mut().as_mut() {
+                    if let Ok(mut guard) = slot.try_borrow_mut()
+                        && let Some(rt) = guard.as_mut()
+                    {
                         let new_dpi_scale = new_dpi / 96.0;
                         let new_scale = (new_dpi_scale * rt.app.cfg.appearance.scale).clamp(0.5, 4.0);
-                        if !suggested.is_null() {
-                            let rc = unsafe { *suggested };
+                        if let Some(rc) = suggested_rc {
                             let nw = (rc.right - rc.left).max(320);
                             let nh = (rc.bottom - rc.top).max(240);
-                            unsafe {
-                                SetWindowPos(
-                                    hwnd,
-                                    std::ptr::null_mut(),
-                                    rc.left,
-                                    rc.top,
-                                    nw,
-                                    nh,
-                                    SWP_NOZORDER | SWP_NOACTIVATE,
-                                );
-                            }
                             rt.mon_x = rc.left;
                             rt.mon_y = rc.top;
                             rt.mon_w = nw;

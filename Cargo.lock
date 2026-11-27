@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-core"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-submenu-abi",
  "serde",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-daemon"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-core",
  "windows-sys",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-installer"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-core",
  "serde",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-sub-apps"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-submenu-abi",
  "serde",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-sub-clipboard"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-submenu-abi",
  "serde",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-sub-files"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-submenu-abi",
  "serde",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-sub-windows"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-submenu-abi",
  "serde",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-submenu-abi"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "serde",
  "serde_json",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "recircles-ui"
-version = "0.2.1-beta"
+version = "0.2.2-beta"
 dependencies = [
  "recircles-core",
  "serde_json",

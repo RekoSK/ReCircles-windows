@@ -370,31 +370,29 @@ pub mod win_render {
             dpi_scale: f64,
             blur_pct: u8,
         ) -> bool {
+            self.capture_backdrop_with(screen_x, screen_y, dpi_scale, blur_pct, |canvas, w, h, sigma| {
+                canvas.capture_backdrop(screen_x, screen_y, w, h, sigma)
+            })
+        }
+
+        fn capture_backdrop_with(
+            &mut self,
+            screen_x: i32,
+            screen_y: i32,
+            dpi_scale: f64,
+            blur_pct: u8,
+            capture: impl FnOnce(&mut D2dCanvas, i32, i32, f64) -> bool,
+        ) -> bool {
             let pct = blur_pct.min(100);
             self.last_backdrop = Some((screen_x, screen_y, dpi_scale, pct));
             self.last_blur_pct = Some(pct);
             let params = blur_params(pct, dpi_scale);
             let sigma = params.map_or(0.0, |(s, _)| s);
-            let ok = self
-                .canvas
-                .capture_backdrop(screen_x, screen_y, self.phys_w, self.phys_h, sigma);
+            let ok = capture(&mut self.canvas, self.phys_w, self.phys_h, sigma);
             if ok && let Some((s, sat)) = params {
                 let _ = self.canvas.set_backdrop_blur(s, sat);
             }
             ok
-        }
-
-        pub fn update_backdrop_dpi(&mut self, dpi_scale: f64, blur_pct: u8) {
-            let pct = blur_pct.min(100);
-            if let Some((sx, sy, _, _)) = self.last_backdrop {
-                self.last_backdrop = Some((sx, sy, dpi_scale, pct));
-            }
-            self.last_blur_pct = Some(pct);
-            if let Some((sigma, sat)) = blur_params(pct, dpi_scale) {
-                let _ = self.canvas.set_backdrop_blur(sigma, sat);
-            } else {
-                let _ = self.canvas.set_backdrop_blur(0.0, 1.0);
-            }
         }
 
         fn sync_backdrop_blur(&mut self, blur_pct: u8) {
@@ -4659,18 +4657,36 @@ pub mod win_render {
 
         #[test]
         fn backdrop_blur_scales_linearly_and_recaptures_cleanly() {
+            // Supply known pixels instead of reading the runner's interactive desktop.
+            // The upload, Direct2D effects, and swap-chain presentation are still real.
+            let capture_fixture = |renderer: &mut Renderer, dpi, pct, shade| {
+                renderer.capture_backdrop_with(0, 0, dpi, pct, |canvas, w, h, sigma| {
+                    let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
+                    for y in 0..h {
+                        for x in 0..w {
+                            let color = if (x / 32 + y / 32) % 2 == 0 { shade } else { 220 };
+                            pixels.extend_from_slice(&[color, color, color, 255]);
+                        }
+                    }
+                    canvas.upload_backdrop_fixture(&pixels, w, h, sigma)
+                })
+            };
             let hwnd = TestHwnd::new(960, 640);
             let mut renderer = Renderer::new(hwnd.0, 960, 640, 1.0).expect("d2d renderer");
             assert!(
-                renderer.capture_backdrop(0, 0, 1.0, 0),
-                "capture_backdrop at 0% should retain raw_backdrop"
+                capture_fixture(&mut renderer, 1.0, 0, 30),
+                "backdrop upload at 0% should retain raw_backdrop"
             );
             assert!(renderer.canvas.has_raw_backdrop(), "raw backdrop must be retained at 0%");
             assert!(!renderer.canvas.has_backdrop(), "0% blur must have no blurred backdrop");
 
-            // Switching from 0% -> 1% -> 50% -> 100% must activate blur smoothly without recapture
-            let (s1, sat1) = blur_params(1, 1.0).unwrap();
-            assert!(renderer.canvas.set_backdrop_blur(s1, sat1));
+            // Blur strength scales linearly, and 1% activates the effect without recapture.
+            let (s1, _) = blur_params(1, 1.0).unwrap();
+            let (s50, _) = blur_params(50, 1.0).unwrap();
+            let (s100, _) = blur_params(100, 1.0).unwrap();
+            assert!((s1 * 100.0 - s100).abs() < 1e-9);
+            assert!((s50 * 2.0 - s100).abs() < 1e-9);
+            renderer.sync_backdrop_blur(1);
             assert!(renderer.canvas.has_backdrop(), "1% blur must activate blurred backdrop");
 
             // Render a frame with annulus, rounded rect (with and without hole), and polygon ring
@@ -4689,19 +4705,19 @@ pub mod win_render {
             assert!(renderer.canvas.end_frame(0), "backdrop frame must present");
 
             // Returning to 0% disables blur while retaining raw_backdrop for instant re-enable
-            renderer.update_backdrop_dpi(1.5, 65);
+            renderer.sync_backdrop_blur(65);
             assert!(renderer.canvas.has_backdrop());
-            renderer.update_backdrop_dpi(1.5, 0);
+            renderer.sync_backdrop_blur(0);
             assert!(!renderer.canvas.has_backdrop());
             assert!(renderer.canvas.has_raw_backdrop());
 
             // In-place recapture at same dimensions and after resize/recreate
-            assert!(renderer.capture_backdrop(0, 0, 1.0, 25));
+            assert!(capture_fixture(&mut renderer, 1.0, 25, 60));
             assert!(renderer.canvas.has_backdrop());
             renderer.resize(1280, 720, 1.25);
-            assert!(renderer.capture_backdrop(0, 0, 1.25, 40));
+            assert!(capture_fixture(&mut renderer, 1.25, 40, 90));
             assert!(renderer.canvas.recreate(), "recreate must succeed on DirectComposition HWND");
-            assert!(renderer.capture_backdrop(0, 0, 1.25, 40));
+            assert!(capture_fixture(&mut renderer, 1.25, 40, 120));
             renderer.canvas.begin_frame(1.25);
             renderer.canvas.fill_rounded_rect_backdrop(40.0, 40.0, 400.0, 260.0, 24.0, 0.0, 1.0);
             assert!(renderer.canvas.end_frame(0), "post-recreate backdrop frame must present");

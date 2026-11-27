@@ -198,15 +198,30 @@ pub const fn os_locked_hotkey_reason(parsed: ParsedKey) -> Option<&'static str> 
     None
 }
 
-/// Returns true for standalone `Win` or well-known Windows 10/11 Shell (`explorer.exe`) `Win+...`
-/// shortcuts. Routing these directly to `WH_KEYBOARD_LL` avoids logon races with `explorer.exe`
-/// so native shortcuts restore immediately whenever unbound or when the daemon exits.
+/// Returns true for standalone `Win`, well-known Windows 10/11 Shell (`explorer.exe`) `Win+...`
+/// shortcuts, and Windows shell/DWM-reserved task-switcher/system chords (`Alt+Tab`, `Alt+Shift+Tab`,
+/// `Ctrl+Alt+Tab`, `Ctrl+Alt+Shift+Tab`, `Alt+Esc`, `Alt+Shift+Esc`, `Ctrl+Esc`, `Ctrl+Shift+Esc`).
+/// Routing these directly to `WH_KEYBOARD_LL` avoids `RegisterHotKey` rejections and logon races
+/// with `explorer.exe` so native shortcuts restore immediately whenever unbound or when the daemon exits.
 pub fn is_known_windows_shell_hotkey(parsed: ParsedKey) -> bool {
     if parsed.is_lone_win() {
         return true;
     }
     if !parsed.mods.win {
-        return false;
+        return match (
+            parsed.mods.ctrl,
+            parsed.mods.alt,
+            parsed.mods.shift,
+            parsed.vk,
+        ) {
+            // Alt+Tab, Alt+Shift+Tab, Ctrl+Alt+Tab, Ctrl+Alt+Shift+Tab (Windows Task Switcher)
+            (_, true, _, VK_TAB) => true,
+            // Alt+Esc, Alt+Shift+Esc (Cycle Windows in Z-order)
+            (false, true, _, VK_ESCAPE) => true,
+            // Ctrl+Esc (Start Menu), Ctrl+Shift+Esc (Task Manager)
+            (true, false, _, VK_ESCAPE) => true,
+            _ => false,
+        };
     }
 
     let vk = parsed.vk;
@@ -588,11 +603,40 @@ mod tests {
             assert_eq!(m.to_bits(), bits);
         }
 
-        for shell_spec in ["Win", "Win+E", "Win+B", "Win+V", "Win+D", "Win+R", "Win+Tab", "Win+Shift+S", "Win+1"] {
+        for shell_spec in [
+            "Win",
+            "Win+E",
+            "Win+B",
+            "Win+V",
+            "Win+D",
+            "Win+R",
+            "Win+Tab",
+            "Win+Shift+S",
+            "Win+1",
+            "Alt+Tab",
+            "Alt+Shift+Tab",
+            "Ctrl+Alt+Tab",
+            "Ctrl+Alt+Shift+Tab",
+            "Alt+Escape",
+            "Alt+Shift+Escape",
+            "Ctrl+Escape",
+            "Ctrl+Shift+Escape",
+        ] {
             let p = parse_global_hotkey(shell_spec).unwrap();
             assert!(is_known_windows_shell_hotkey(p), "{shell_spec} should be shell hotkey");
         }
-        for non_shell_spec in ["Win+J", "Win+O", "Win+Y", "Win+Alt+E", "Ctrl+Space", "F9"] {
+        for non_shell_spec in [
+            "Win+J",
+            "Win+O",
+            "Win+Y",
+            "Win+Alt+E",
+            "Ctrl+Space",
+            "Ctrl+Tab",
+            "Shift+Tab",
+            "Alt+Space",
+            "Alt+F4",
+            "F9",
+        ] {
             let p = parse_global_hotkey(non_shell_spec).unwrap();
             assert!(
                 !is_known_windows_shell_hotkey(p),

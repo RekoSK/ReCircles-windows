@@ -349,24 +349,40 @@ fn shell_open(path: &str, params: Option<&str>) -> Result<(), String> {
     {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+        use windows_sys::Win32::UI::Shell::{
+            SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+        };
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-        let verb: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { CoUninitialize() };
+                }
+            }
+        }
+        let hr_com = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        let _com_guard = ComGuard(hr_com >= 0);
+
         let file: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
         let par_w: Option<Vec<u16>> = params.map(|p| OsStr::new(p).encode_wide().chain(Some(0)).collect());
-        let rc = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                verb.as_ptr(),
-                file.as_ptr(),
-                par_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        } as isize;
-        if rc <= 32 {
-            return Err(format!("ShellExecute failed ({rc}) opening '{path}'"));
+        let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        sei.fMask = SEE_MASK_NOASYNC;
+        sei.lpVerb = std::ptr::null();
+        sei.lpFile = file.as_ptr();
+        sei.lpParameters = par_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        sei.nShow = SW_SHOWNORMAL;
+
+        let ok = unsafe { ShellExecuteExW(&mut sei) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(format!("ShellExecuteEx failed (Win32 error {err}) opening '{path}'"));
         }
         Ok(())
     }

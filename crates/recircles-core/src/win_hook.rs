@@ -680,6 +680,9 @@ pub mod win {
     const WM_MASK_RELEASE: u32 = 0x8000 + 211;
     const WM_MASK_SHUTDOWN: u32 = 0x8000 + 212;
 
+    /// `KBDLLHOOKSTRUCT.flags` bit indicating the kernel Alt context is active for this key event.
+    const LLKHF_ALTDOWN: u32 = 0x20;
+
     fn is_async_down(vk: u16) -> bool {
         unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
     }
@@ -877,7 +880,10 @@ pub mod win {
         };
 
         let vk = kb.vkCode;
-        let async_mods = read_async_modifiers();
+        let mut async_mods = read_async_modifiers();
+        if (kb.flags & LLKHF_ALTDOWN) != 0 {
+            async_mods.alt = true;
+        }
         let was_already_down = if is_down && vk <= 0xFFFF {
             is_async_down(vk as u16)
         } else {
@@ -1179,7 +1185,10 @@ pub mod win {
         };
 
         let vk = kb.vkCode;
-        let async_mods = read_async_modifiers();
+        let mut async_mods = read_async_modifiers();
+        if (kb.flags & LLKHF_ALTDOWN) != 0 {
+            async_mods.alt = true;
+        }
         let was_already_down = if is_down && vk <= 0xFFFF {
             is_async_down(vk as u16)
         } else {
@@ -1328,11 +1337,18 @@ pub mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::win_keys::{VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RWIN};
+    use crate::win_keys::{VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RWIN, VK_TAB};
 
     fn win_only() -> Modifiers {
         Modifiers {
             win: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt_only() -> Modifiers {
+        Modifiers {
+            alt: true,
             ..Default::default()
         }
     }
@@ -1837,6 +1853,107 @@ mod tests {
                 mask_menu: false,
             }
         );
+    }
+
+    #[test]
+    fn hook_matcher_triggers_alt_tab_masks_alt_and_swallows_repeat_and_rollover() {
+        let mut m = HookMatcher::new(vec![HookBindingEntry {
+            id: 42,
+            mods: alt_only(),
+            vk: VK_TAB,
+            lone_win: false,
+        }]);
+
+        // LAlt down passes through
+        assert_eq!(
+            m.process_key(VK_LMENU, true, Modifiers::default(), false, 1000, 0),
+            HookDecision::PassThrough
+        );
+        // Tab down while Alt held triggers with Alt menu-bar mask
+        assert_eq!(
+            m.process_key(VK_TAB, true, alt_only(), false, 1020, 0),
+            HookDecision::Trigger {
+                id: 42,
+                mask_menu: true,
+            }
+        );
+        // Key auto-repeat while holding Alt+Tab is swallowed
+        assert_eq!(
+            m.process_key(VK_TAB, true, alt_only(), false, 1300, 0),
+            HookDecision::SwallowOnly
+        );
+        // Ultra-fast Alt release BEFORE VK_MASK_DUMMY passes through -> atomic mask + Alt up
+        assert_eq!(
+            m.process_key(VK_LMENU, false, Modifiers::default(), false, 1320, 0),
+            HookDecision::MaskModifierRelease { mod_vk: VK_LMENU }
+        );
+        // Tab key-up is swallowed cleanly
+        assert_eq!(
+            m.process_key(VK_TAB, false, Modifiers::default(), false, 1350, 0),
+            HookDecision::SwallowOnly
+        );
+        // Plain Tab afterwards passes through untouched
+        assert_eq!(
+            m.process_key(VK_TAB, true, Modifiers::default(), false, 1400, 0),
+            HookDecision::PassThrough
+        );
+        // Alt+Shift+Tab must NOT falsely trigger an Alt+Tab binding
+        assert_eq!(
+            m.process_key(VK_LMENU, true, Modifiers::default(), false, 2000, 0),
+            HookDecision::PassThrough
+        );
+        assert_eq!(
+            m.process_key(VK_LSHIFT, true, alt_only(), false, 2010, 0),
+            HookDecision::PassThrough
+        );
+        assert_eq!(
+            m.process_key(
+                VK_TAB,
+                true,
+                Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                false,
+                2020,
+                0
+            ),
+            HookDecision::PassThrough
+        );
+    }
+
+    #[test]
+    fn capture_matcher_captures_alt_tab_and_masks_fast_alt_release() {
+        let mut c = CaptureMatcher::new(true);
+
+        assert_eq!(
+            c.process_key(VK_LMENU, true, Modifiers::default(), false, 1000, 0),
+            CaptureDecision::PassThrough
+        );
+        assert_eq!(
+            c.process_key(VK_TAB, true, alt_only(), false, 1020, 0),
+            CaptureDecision::Captured {
+                vk: VK_TAB,
+                mods: alt_only(),
+                mask_menu: true,
+            }
+        );
+        assert!(c.has_suppressed());
+
+        // UI accepted Alt+Tab and switched hook to draining mode
+        c.set_active(false, false);
+        assert_eq!(
+            c.process_key(VK_LMENU, false, Modifiers::default(), false, 1030, 0),
+            CaptureDecision::MaskModifierRelease { mod_vk: VK_LMENU }
+        );
+        assert_eq!(
+            c.process_key(VK_TAB, false, Modifiers::default(), false, 1050, 0),
+            CaptureDecision::SwallowOnly {
+                finished_draining: true,
+            }
+        );
+        assert!(!c.has_suppressed());
     }
 
     #[cfg(windows)]

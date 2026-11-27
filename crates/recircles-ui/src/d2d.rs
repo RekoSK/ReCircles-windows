@@ -166,6 +166,14 @@ unsafe extern "C" {
         phys_h: i32,
         blur_sigma_px: f32,
     ) -> i32;
+    #[cfg(test)]
+    fn d2d_upload_backdrop_pixels(
+        ctx: *mut c_void,
+        pixels: *const u8,
+        phys_w: i32,
+        phys_h: i32,
+        blur_sigma_px: f32,
+    ) -> i32;
     fn d2d_set_backdrop_blur(ctx: *mut c_void, blur_sigma_px: f32, saturation: f32) -> i32;
     fn d2d_has_backdrop(ctx: *mut c_void) -> i32;
     fn d2d_has_raw_backdrop(ctx: *mut c_void) -> i32;
@@ -640,6 +648,33 @@ impl D2dCanvas {
                 self.ptr,
                 screen_x,
                 screen_y,
+                phys_w,
+                phys_h,
+                blur_sigma_px as f32,
+            ) != 0
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upload_backdrop_fixture(
+        &mut self,
+        pixels: &[u8],
+        phys_w: i32,
+        phys_h: i32,
+        blur_sigma_px: f64,
+    ) -> bool {
+        assert!(phys_w > 0 && phys_h > 0 && phys_w <= i32::MAX / 4);
+        assert_eq!(
+            (phys_w as usize)
+                .checked_mul(phys_h as usize)
+                .and_then(|count| count.checked_mul(4)),
+            Some(pixels.len())
+        );
+        // The native upload consumes tightly packed BGRA rows synchronously.
+        unsafe {
+            d2d_upload_backdrop_pixels(
+                self.ptr,
+                pixels.as_ptr(),
                 phys_w,
                 phys_h,
                 blur_sigma_px as f32,

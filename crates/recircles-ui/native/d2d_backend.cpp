@@ -1250,6 +1250,48 @@ bool rebuild_blurred_backdrop(D2dCtx* ctx, float blur_sigma_px, float saturation
     return true;
 }
 
+bool upload_backdrop_pixels(D2dCtx* ctx, const void* bits, int phys_w, int phys_h, float blur_sigma_px) {
+    if (!ctx || !ctx->d2d_ctx || !bits || phys_w <= 0 || phys_h <= 0) return false;
+
+    // Reuse existing GPU raw_backdrop when monitor dimensions match to avoid texture churn.
+    HRESULT hr = S_OK;
+    if (ctx->raw_backdrop && ctx->backdrop_w == phys_w && ctx->backdrop_h == phys_h) {
+        hr = ctx->raw_backdrop->CopyFromMemory(nullptr, bits, static_cast<UINT32>(phys_w * 4));
+    } else {
+        ctx->has_backdrop = false;
+        ctx->backdrop_brush.Reset();
+        ctx->blurred_backdrop.Reset();
+        ctx->raw_backdrop.Reset();
+        // D2D1_ALPHA_MODE_IGNORE treats GDI BitBlt RGBX pixels as opaque without a CPU pixel loop.
+        ComPtr<ID2D1Bitmap1> src_bmp;
+        D2D1_BITMAP_PROPERTIES1 src_props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f, 96.0f);
+        hr = ctx->d2d_ctx->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(phys_w), static_cast<UINT32>(phys_h)),
+            bits, static_cast<UINT32>(phys_w * 4), &src_props, &src_bmp);
+        if (SUCCEEDED(hr) && src_bmp) {
+            ctx->raw_backdrop = std::move(src_bmp);
+            ctx->backdrop_w = phys_w;
+            ctx->backdrop_h = phys_h;
+        }
+    }
+    if (FAILED(hr) || !ctx->raw_backdrop) return false;
+
+    ctx->last_blur_sigma = -1.0f;
+    ctx->last_blur_sat = -1.0f;
+
+    if (blur_sigma_px <= 0.01f) {
+        ctx->has_backdrop = false;
+        ctx->last_blur_sigma = 0.0f;
+        ctx->last_blur_sat = 1.0f;
+        return true;
+    }
+    float def_sat = 1.0f + 0.24f * std::clamp(blur_sigma_px / (32.0f * ctx->logical_scale), 0.0f, 1.0f);
+    return rebuild_blurred_backdrop(ctx, blur_sigma_px, def_sat);
+}
+
 } // namespace
 
 extern "C" {
@@ -1393,44 +1435,13 @@ int d2d_capture_backdrop(D2dCtx* ctx, int screen_x, int screen_y, int phys_w, in
         return 0;
     }
 
-    // Reuse existing GPU raw_backdrop when monitor dimensions match to avoid texture churn.
-    HRESULT hr = S_OK;
-    if (ctx->raw_backdrop && ctx->backdrop_w == phys_w && ctx->backdrop_h == phys_h) {
-        hr = ctx->raw_backdrop->CopyFromMemory(nullptr, bits, static_cast<UINT32>(phys_w * 4));
-    } else {
-        ctx->has_backdrop = false;
-        ctx->backdrop_brush.Reset();
-        ctx->blurred_backdrop.Reset();
-        ctx->raw_backdrop.Reset();
-        // D2D1_ALPHA_MODE_IGNORE treats GDI BitBlt RGBX pixels as opaque without a CPU pixel loop.
-        ComPtr<ID2D1Bitmap1> src_bmp;
-        D2D1_BITMAP_PROPERTIES1 src_props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_NONE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-            96.0f, 96.0f);
-        hr = ctx->d2d_ctx->CreateBitmap(
-            D2D1::SizeU(static_cast<UINT32>(phys_w), static_cast<UINT32>(phys_h)),
-            bits, static_cast<UINT32>(phys_w * 4), &src_props, &src_bmp);
-        if (SUCCEEDED(hr) && src_bmp) {
-            ctx->raw_backdrop = std::move(src_bmp);
-            ctx->backdrop_w = phys_w;
-            ctx->backdrop_h = phys_h;
-        }
-    }
+    const bool uploaded = upload_backdrop_pixels(ctx, bits, phys_w, phys_h, blur_sigma_px);
     DeleteObject(dib);
-    if (FAILED(hr) || !ctx->raw_backdrop) return 0;
+    return uploaded ? 1 : 0;
+}
 
-    ctx->last_blur_sigma = -1.0f;
-    ctx->last_blur_sat = -1.0f;
-
-    if (blur_sigma_px <= 0.01f) {
-        ctx->has_backdrop = false;
-        ctx->last_blur_sigma = 0.0f;
-        ctx->last_blur_sat = 1.0f;
-        return 1;
-    }
-    float def_sat = 1.0f + 0.24f * std::clamp(blur_sigma_px / (32.0f * ctx->logical_scale), 0.0f, 1.0f);
-    return rebuild_blurred_backdrop(ctx, blur_sigma_px, def_sat) ? 1 : 0;
+int d2d_upload_backdrop_pixels(D2dCtx* ctx, const void* pixels, int phys_w, int phys_h, float blur_sigma_px) {
+    return upload_backdrop_pixels(ctx, pixels, phys_w, phys_h, blur_sigma_px) ? 1 : 0;
 }
 
 int d2d_set_backdrop_blur(D2dCtx* ctx, float blur_sigma_px, float saturation) {
